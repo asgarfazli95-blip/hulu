@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-𝐒𝐇𝐀𝐃𝐎𝐖 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 v8
+𝐒𝐇𝐀𝐃𝐎𝐖 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 v9
+- Resilience layer: safe_reply / safe_edit / safe_send / shield / on_error
+- Terminal escape: menu button during TERM_SESSION exits cleanly + dispatches
 - UTF-8 forced on Windows (cp1252 fix)
-- Terminal escape fix: menu buttons exit cleanly + dispatch
-- Aesthetic polish across all menus
 - env vars · live stdin · scheduler · file manager
-- auto-restore on boot · crash notify · self-restart wrapper
+- auto-restore on boot · crash notify · self-restart with backoff
+- NO token fallback — BOT_TOKEN must come from env
 """
 
-import asyncio, hashlib, json, os, re, shlex, shutil, sys, time, traceback, zipfile
-from datetime import datetime, timedelta
-from pathlib import Path
-from threading import Thread
-from typing import Dict, Optional
-
-# ---- force UTF-8 output on Windows (cp1252 fix) ----
+# ---- UTF-8 force on Windows ----
+import os, sys
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONLEGACYWINDOWSSTDIO", "0")
@@ -32,8 +28,17 @@ def _boot():
         except ImportError: need.append(pkg)
     if need:
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", *need])
-_boot()
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *need])
+try:
+    _boot()
+except Exception as e:
+    print(f"[SHADOW] boot deps failed: {e}", file=sys.stderr)
+
+import asyncio, functools, hashlib, json, logging, re, shlex, shutil, time, traceback, zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from threading import Thread
+from typing import Dict, Optional
 
 import psutil
 from dotenv import load_dotenv
@@ -41,13 +46,154 @@ from flask import Flask, jsonify
 from telegram import (ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton,
                       InlineKeyboardMarkup, Update, BotCommand)
 from telegram.constants import ParseMode
+from telegram.error import (BadRequest, Forbidden, RetryAfter, TimedOut,
+                            NetworkError, TelegramError, Conflict)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ConversationHandler, MessageHandler, filters, ContextTypes)
 
+# ==================== LOGGING ====================
+log = logging.getLogger("shadow")
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
+
+# ==================== RESILIENCE LAYER ====================
+RETRY_MAX = 3
+RETRY_BASE = 1.5
+RETRYABLE = (TimedOut, NetworkError, RetryAfter)
+
+async def _retry(coro_factory, max_tries=RETRY_MAX):
+    last = None
+    for attempt in range(max_tries):
+        try:
+            return await coro_factory()
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+            last = e
+        except RETRYABLE as e:
+            await asyncio.sleep(RETRY_BASE ** attempt)
+            last = e
+    if last: raise last
+
+async def safe_reply(message, text, **kwargs):
+    if message is None: return None
+    async def _do():
+        try:
+            return await message.reply_text(text, **kwargs)
+        except BadRequest as e:
+            s = str(e).lower()
+            if "not found" in s or "reply" in s or "message to be" in s:
+                return await message.get_bot().send_message(
+                    chat_id=message.chat_id, text=text, **kwargs)
+            if "parse" in s or "entities" in s:
+                k = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+                return await message.get_bot().send_message(
+                    chat_id=message.chat_id, text=text, **k)
+            raise
+        except Forbidden:
+            return None
+    try:
+        return await _retry(_do)
+    except TelegramError as e:
+        log.warning("safe_reply gave up: %s", e)
+        return None
+
+async def safe_edit(query, text, **kwargs):
+    if query is None: return None
+    async def _do():
+        try:
+            return await query.edit_message_text(text, **kwargs)
+        except BadRequest as e:
+            s = str(e).lower()
+            if "not modified" in s:
+                return None
+            if "not found" in s or "message to edit" in s:
+                return await query.get_bot().send_message(
+                    chat_id=query.from_user.id, text=text, **kwargs)
+            if "parse" in s or "entities" in s:
+                k = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+                return await query.get_bot().send_message(
+                    chat_id=query.from_user.id, text=text, **k)
+            raise
+    try:
+        return await _retry(_do)
+    except TelegramError as e:
+        log.warning("safe_edit gave up: %s", e)
+        return None
+
+async def safe_send(bot, chat_id, text, **kwargs):
+    async def _do():
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except BadRequest as e:
+            if "parse" in str(e).lower() or "entities" in str(e).lower():
+                k = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+                return await bot.send_message(chat_id=chat_id, text=text, **k)
+            raise
+        except Forbidden:
+            return None
+    try:
+        return await _retry(_do)
+    except TelegramError as e:
+        log.warning("safe_send gave up: %s", e)
+        return None
+
+async def _nudge(update, context):
+    try:
+        if update is not None and getattr(update, "callback_query", None):
+            try: await update.callback_query.answer()
+            except Exception: pass
+        chat_id = None
+        if update is not None and getattr(update, "effective_chat", None):
+            chat_id = update.effective_chat.id
+        elif (update is not None and getattr(update, "callback_query", None)
+              and update.callback_query.from_user):
+            chat_id = update.callback_query.from_user.id
+        if chat_id is None: return
+        await context.bot.send_message(chat_id=chat_id,
+            text="⚠️ that action hiccuped — try once more")
+    except Exception:
+        pass
+
+def shield(fn):
+    @functools.wraps(fn)
+    async def _wrap(update, context, *a, **kw):
+        try:
+            return await fn(update, context, *a, **kw)
+        except (BadRequest, Forbidden) as e:
+            log.warning("shield[%s] soft: %s", fn.__name__, e)
+            await _nudge(update, context)
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+            try: return await fn(update, context, *a, **kw)
+            except Exception as e2:
+                log.warning("shield[%s] retry-fail: %s", fn.__name__, e2)
+        except Conflict as e:
+            log.error("TOKEN CONFLICT — another instance is polling: %s", e)
+        except Exception as e:
+            log.exception("shield[%s] hard: %s", fn.__name__, e)
+            await _nudge(update, context)
+    return _wrap
+
+async def on_error(update, context):
+    err = context.error
+    if isinstance(err, Conflict):
+        log.error("POLLING CONFLICT — same BOT_TOKEN elsewhere: %s", err); return
+    if isinstance(err, RetryAfter):
+        await asyncio.sleep(float(err.retry_after) + 0.5); return
+    if isinstance(err, (BadRequest, Forbidden)):
+        log.warning("error handler soft: %s", err); return
+    log.exception("error handler:", exc_info=err)
+    await _nudge(update, context)
+
 # ==================== CONFIG ====================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8886195149:AAFPrHQfIPmPDwtnZs8tPDxc-NO9CUgV3OM")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "7263812907,8846085944").split(",") if x.strip().isdigit()]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN missing — set it in env / .env file")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 CHANNEL    = os.getenv("CHANNEL_USERNAME", "").strip()
 PORT       = int(os.getenv("PORT", "8080"))
 WORKSPACE  = Path(os.getenv("WORKSPACE_BASE", "./workspaces")).resolve()
@@ -80,9 +226,7 @@ SEP = "━" * 22
 
 def banner(title: str = "") -> str:
     head = f"🌑 · {BRAND} · 🌑"
-    if title:
-        return f"{head}\n{SEP}\n{title}"
-    return f"{head}\n{SEP}"
+    return f"{head}\n{SEP}\n{title}" if title else f"{head}\n{SEP}"
 
 def divider() -> str:
     return "· · · · · · · · · · · · · · · ·"
@@ -104,7 +248,7 @@ def persist():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(D, f, indent=2, default=str, ensure_ascii=False)
     except Exception as e:
-        print(f"[persist] {e}")
+        log.warning("persist: %s", e)
 
 def mark(k, n): INSTALLED[f"{k}:{n}"] = True; persist()
 def has(k, n):  return INSTALLED.get(f"{k}:{n}", False)
@@ -174,13 +318,13 @@ async def install_runtime(lang):
     elif shutil.which("brew"):    cmds = [["brew", "install", *pkgs_list]]
     elif shutil.which("choco"):   cmds = [["choco", "install", "-y", *pkgs_list]]
     else: return False, f"manual: {pkgs}"
-    log = []
+    out_log = []
     for c in cmds:
         rc, out = await run_cmd(c)
-        log.append(f"$ {' '.join(c)}\n{out[-250:]}")
-        if rc != 0: return False, "\n".join(log)[-500:]
+        out_log.append(f"$ {' '.join(c)}\n{out[-250:]}")
+        if rc != 0: return False, "\n".join(out_log)[-500:]
     if which_any(checks): mark("rt", lang); return True, "installed"
-    return False, "\n".join(log)[-500:]
+    return False, "\n".join(out_log)[-500:]
 
 # ==================== ERROR PARSER ====================
 PARSERS = [
@@ -289,9 +433,8 @@ class ScriptSupervisor:
         e = RUNTIME_PKGS.get(self.lang)
         if not e or which_any(e[1]): return True
         if bot:
-            try: await bot.send_message(self.uid, f"⚙️ installing runtime *{self.lang}*…",
-                                        parse_mode=ParseMode.MARKDOWN)
-            except Exception: pass
+            await safe_send(bot, self.uid, f"⚙️ installing runtime *{self.lang}*…",
+                            parse_mode=ParseMode.MARKDOWN)
         ok, info = await install_runtime(self.lang)
         self._w(f"rt {self.lang}: {ok} {info[:200]}")
         return ok
@@ -364,18 +507,14 @@ class ScriptSupervisor:
                 s = await ai_fix(tail)
                 if s.startswith("FIX:"): note = f"🤖 {s[4:].strip()}"
             if note:
-                try:
-                    await bot.send_message(self.uid,
-                        f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…",
-                        parse_mode=ParseMode.MARKDOWN)
-                except Exception: pass
+                await safe_send(bot, self.uid,
+                    f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…",
+                    parse_mode=ParseMode.MARKDOWN)
             else:
-                try:
-                    snippet = tail[-400:]
-                    await bot.send_message(self.uid,
-                        f"💥 *crash* · `{self.path.name}`\n```\n{snippet}\n```\n♻️ restarting…",
-                        parse_mode=ParseMode.MARKDOWN)
-                except Exception: pass
+                snippet = tail[-400:]
+                await safe_send(bot, self.uid,
+                    f"💥 *crash* · `{self.path.name}`\n```\n{snippet}\n```\n♻️ restarting…",
+                    parse_mode=ParseMode.MARKDOWN)
             self.restarts += 1
             await asyncio.sleep(min(self.backoff, 60))
             self.backoff = min(self.backoff * 2, 60)
@@ -433,11 +572,11 @@ async def scheduler_loop():
                         except asyncio.TimeoutError:
                             proc.kill(); f.write("[SCHED] timed out\n")
                 except Exception as e:
-                    print(f"[sched] {e}")
+                    log.warning("[sched] %s", e)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"[sched loop] {e}")
+            log.warning("[sched loop] %s", e)
 
 # ==================== USER / SCRIPT ====================
 def get_user(uid): return USERS.get(str(uid))
@@ -461,13 +600,10 @@ def unban(uid): return approve(uid)
 
 def is_ok(uid):
     u = get_user(uid); return bool(u and u["status"] == "approved")
-
 def is_pend(uid):
     u = get_user(uid); return bool(u and u["status"] == "pending")
-
 def is_ban(uid):
     u = get_user(uid); return bool(u and u["status"] == "banned")
-
 def user_scripts(uid): return [s for s in SCRIPTS.values() if s["user_id"] == uid]
 
 def ws_of(uid):
@@ -530,9 +666,8 @@ BTN_STATS  = "📊 Stats"
 BTN_STOP   = "🛑 Stop All"
 BTN_FILES  = "📂 Files"
 BTN_ADMIN  = "👑 Admin Panel"
-
-BTN_TEXTS = {BTN_DEPLOY, BTN_UPLOAD, BTN_TERM, BTN_LOGS,
-             BTN_STATS, BTN_STOP, BTN_FILES, BTN_ADMIN}
+BTN_TEXTS  = {BTN_DEPLOY, BTN_UPLOAD, BTN_TERM, BTN_LOGS,
+              BTN_STATS, BTN_STOP, BTN_FILES, BTN_ADMIN}
 
 def reply_kb(uid):
     rows = [[BTN_DEPLOY, BTN_UPLOAD], [BTN_TERM, BTN_FILES],
@@ -545,6 +680,7 @@ def back(t="main_menu"):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=t)]])
 
 # ==================== START ====================
+@shield
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     uid, name, uname = u.id, u.full_name, u.username or "no_username"
@@ -552,34 +688,31 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             m = await ctx.bot.get_chat_member(CHANNEL, uid)
             if m.status in ("left", "kicked"):
-                await update.message.reply_text(f"🔒 join {CHANNEL}",
+                await safe_reply(update.message, f"🔒 join {CHANNEL}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("📢 Join", url=f"https://t.me/{CHANNEL.lstrip('@')}")],
                         [InlineKeyboardButton("✅ Verify", callback_data="check_join")]]))
                 return
-        except Exception:
-            await update.message.reply_text("⚠️ verify failed"); return
+        except Exception as e:
+            log.warning("channel check: %s", e)
+            await safe_reply(update.message, "⚠️ verify failed"); return
     if not get_user(uid):
         add_user(uid, name, uname)
         for aid in ADMIN_IDS:
-            try:
-                await ctx.bot.send_message(aid,
-                    f"🔔 *New Request*\n👤 {name}\n🆔 `{uid}`\n📛 @{uname}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-                        InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}")]]))
-            except Exception:
-                pass
-        await update.message.reply_text(banner("✅ request sent to admin")); return
-    if is_ban(uid):
-        await update.message.reply_text("🚫 banned"); return
-    if is_pend(uid):
-        await update.message.reply_text("⏳ pending"); return
-    await update.message.reply_text(banner(f"👋 welcome {name}"), reply_markup=reply_kb(uid))
+            await safe_send(ctx.bot, aid,
+                f"🔔 *New Request*\n👤 {name}\n🆔 `{uid}`\n📛 @{uname}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
+                    InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}")]]))
+        await safe_reply(update.message, banner("✅ request sent to admin")); return
+    if is_ban(uid):  await safe_reply(update.message, "🚫 banned"); return
+    if is_pend(uid): await safe_reply(update.message, "⏳ pending"); return
+    await safe_reply(update.message, banner(f"👋 welcome {name}"), reply_markup=reply_kb(uid))
 
+@shield
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await safe_reply(update.message,
         banner("ℹ️ Help") + "\n\n"
         "🚀  Deploy      — list & run uploaded scripts\n"
         "📁  Upload      — .py .js .ts .sh .php .rb .go .lua .pl .ps1 .zip\n"
@@ -592,6 +725,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Missing runtimes/deps install themselves on first crash.",
         reply_markup=reply_kb(update.effective_user.id))
 
+@shield
 async def check_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = q.from_user.id
@@ -599,19 +733,20 @@ async def check_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             m = await ctx.bot.get_chat_member(CHANNEL, uid)
             if m.status in ("left", "kicked"):
-                await q.edit_message_text("❌ not joined"); return
+                await safe_edit(q, "❌ not joined"); return
         except Exception:
-            await q.edit_message_text("⚠️ err"); return
+            await safe_edit(q, "⚠️ err"); return
     if not get_user(uid):
         add_user(uid, q.from_user.full_name, q.from_user.username or "no_username")
-        await q.edit_message_text("✅ request sent"); return
-    if is_ban(uid): await q.edit_message_text("🚫"); return
-    if is_pend(uid): await q.edit_message_text("⏳"); return
-    await q.edit_message_text(banner("📋 menu"), reply_markup=back())
+        await safe_edit(q, "✅ request sent"); return
+    if is_ban(uid):  await safe_edit(q, "🚫"); return
+    if is_pend(uid): await safe_edit(q, "⏳"); return
+    await safe_edit(q, banner("📋 menu"), reply_markup=back())
 
+@shield
 async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    await q.edit_message_text(banner("📋 menu"), reply_markup=back())
+    await safe_edit(q, banner("📋 menu"), reply_markup=back())
 
 # ==================== DEPLOY ====================
 async def _deploy_rows(uid):
@@ -623,38 +758,39 @@ async def _deploy_rows(uid):
                                           callback_data=f"sview_{s['sid']}")])
     return rows
 
+@shield
 async def on_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌ not approved", reply_markup=reply_kb(uid)); return
+        await safe_reply(update.message, "❌ not approved", reply_markup=reply_kb(uid)); return
     rows = await _deploy_rows(uid)
     if not rows:
-        await update.message.reply_text(banner("📂 no scripts") + "\n\nupload one first",
+        await safe_reply(update.message, banner("📂 no scripts") + "\n\nupload one first",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 Upload", callback_data="upload")]]))
         return
-    await update.message.reply_text(banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_reply(update.message, banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
 
+@shield
 async def deploy_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     rows = await _deploy_rows(q.from_user.id)
     if not rows:
-        await q.edit_message_text("no scripts"); return
-    await q.edit_message_text(banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
+        await safe_edit(q, "no scripts"); return
+    await safe_edit(q, banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
 
+@shield
 async def script_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sview_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌ not found"); return
+        await safe_edit(q, "❌ not found"); return
     sup = SUPERVISORS.get(sid)
     run = sup.running() if sup else False
     pid = sup.proc.pid if sup and run else "—"
     auto = "♻️ ON" if s.get("autorestart", True) else "⛔ OFF"
     st = sup.stats() if sup else None
-    stats_line = ""
-    if st:
-        stats_line = f"\n📈 CPU `{st['cpu']}%` · RAM `{st['mem']}MB` · up `{st['uptime']}s`"
+    stats_line = f"\n📈 CPU `{st['cpu']}%` · RAM `{st['mem']}MB` · up `{st['uptime']}s`" if st else ""
     iv = s.get("interval")
     sched_line = f"\n⏰ every `{iv}s`" if iv else ""
     txt = (banner(f"📄 {s['filename']}") + "\n\n"
@@ -678,7 +814,7 @@ async def script_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                InlineKeyboardButton(f"♻️ {auto}", callback_data=f"sauto_{sid}")])
     kb.append([InlineKeyboardButton("🗑 Delete", callback_data=f"sdel_{sid}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data="deploy_list")])
-    await q.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
 
 async def _launch(uid, sid, bot):
     s = SCRIPTS.get(sid)
@@ -702,108 +838,116 @@ async def _launch(uid, sid, bot):
         pass
     return f"❌ failed\n```\n{tail}\n```"
 
+@shield
 async def script_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sstart_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
-    await q.edit_message_text("⏳ starting…")
+        await safe_edit(q, "❌"); return
+    await safe_edit(q, "⏳ starting…")
     msg = await _launch(q.from_user.id, sid, ctx.bot)
-    await q.edit_message_text(f"{msg}\n🆔 `{sid}`", parse_mode=ParseMode.MARKDOWN,
+    await safe_edit(q, f"{msg}\n🆔 `{sid}`", parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data=f"sview_{sid}")],
             [InlineKeyboardButton("📜 Log",     callback_data=f"slog_{sid}")]]))
 
+@shield
 async def script_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sstop_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     if sup := SUPERVISORS.get(sid): await sup.stop()
-    await q.edit_message_text(f"🛑 stopped `{sid}`", parse_mode=ParseMode.MARKDOWN,
+    await safe_edit(q, f"🛑 stopped `{sid}`", parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"sview_{sid}")]]))
 
+@shield
 async def script_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("srestart_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     if sup := SUPERVISORS.get(sid): await sup.stop()
-    await q.edit_message_text("🔄 restarting…")
+    await safe_edit(q, "🔄 restarting…")
     msg = await _launch(q.from_user.id, sid, ctx.bot)
-    await q.edit_message_text(f"{msg}\n🆔 `{sid}`", parse_mode=ParseMode.MARKDOWN,
+    await safe_edit(q, f"{msg}\n🆔 `{sid}`", parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"sview_{sid}")]]))
 
+@shield
 async def script_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sauto_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     s["autorestart"] = not s.get("autorestart", True); persist()
     if sup := SUPERVISORS.get(sid): sup.auto = s["autorestart"]
     await script_view(update, ctx)
 
+@shield
 async def script_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sdel_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     if sup := SUPERVISORS.pop(sid, None): await sup.stop()
     try: Path(s["path"]).unlink()
     except Exception: pass
     SCRIPTS.pop(sid, None); persist()
-    await q.edit_message_text("🗑 deleted", reply_markup=back("deploy_list"))
+    await safe_edit(q, "🗑 deleted", reply_markup=back("deploy_list"))
 
+@shield
 async def script_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("slog_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     sup = SUPERVISORS.get(sid)
     lp = sup.log if sup else Path(s["path"]).parent / "logs" / f"{sid}.log"
     try:
         tail = lp.read_text(encoding="utf-8", errors="replace")[-3500:] if lp.exists() else "(no log yet)"
     except Exception as e:
         tail = f"err: {e}"
-    await q.edit_message_text(f"📜 *{s['filename']}*\n\n```\n{tail}\n```",
+    await safe_edit(q, f"📜 *{s['filename']}*\n\n```\n{tail}\n```",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data=f"slog_{sid}")],
             [InlineKeyboardButton("🔙 Back",     callback_data=f"sview_{sid}")]]))
 
+@shield
 async def script_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("scode_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     try:
         p = Path(s["path"]); c = p.read_text(encoding="utf-8", errors="replace")
         if len(c) > 3500: c = c[:3500] + "\n…"
-        await q.edit_message_text(f"👁 `{p.name}`\n\n```\n{c}\n```", parse_mode=ParseMode.MARKDOWN,
+        await safe_edit(q, f"👁 `{p.name}`\n\n```\n{c}\n```", parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"sview_{sid}")]]))
     except Exception as e:
-        await q.edit_message_text(f"❌ {e}")
+        await safe_edit(q, f"❌ {e}")
 
 # ==================== CONVERSATIONS ====================
 (UP_WAIT, TERM_SESSION, EDIT_WAIT, BC_WAIT, ENV_WAIT, INPUT_WAIT, SCH_WAIT) = range(7)
 
 # --- Upload ---
+@shield
 async def up_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌ not approved", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, "❌ not approved", reply_markup=reply_kb(uid))
         return ConversationHandler.END
     if len(user_scripts(uid)) >= MAX_SCRIPTS:
-        await update.message.reply_text(f"❌ quota reached ({MAX_SCRIPTS})", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, f"❌ quota reached ({MAX_SCRIPTS})", reply_markup=reply_kb(uid))
         return ConversationHandler.END
-    await update.message.reply_text(banner("📁 Upload") + "\n\nsend a script or .zip\n/cancel to abort")
+    await safe_reply(update.message, banner("📁 Upload") + "\n\nsend a script or .zip\n/cancel to abort")
     return UP_WAIT
 
 async def _store_script(uid, path: Path, lang, filename):
@@ -815,53 +959,55 @@ async def _store_script(uid, path: Path, lang, filename):
     persist()
     return sid
 
+@shield
 async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     doc = update.message.document
     if not doc:
-        await update.message.reply_text("❌ send a file"); return UP_WAIT
+        await safe_reply(update.message, "❌ send a file"); return UP_WAIT
     fn = doc.file_name or "file.bin"
     ext = Path(fn).suffix.lower()
     if ext not in LANGS and ext != ".zip":
-        await update.message.reply_text(f"❌ `{ext}` not supported", parse_mode=ParseMode.MARKDOWN,
-                                        reply_markup=reply_kb(uid))
+        await safe_reply(update.message, f"❌ `{ext}` not supported", parse_mode=ParseMode.MARKDOWN,
+                         reply_markup=reply_kb(uid))
         return ConversationHandler.END
     if doc.file_size and doc.file_size > MAX_UP:
-        await update.message.reply_text("❌ too large", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, "❌ too large", reply_markup=reply_kb(uid))
         return ConversationHandler.END
     ws = ws_of(uid); safe = safe_name(fn); dst = (ws / safe).resolve()
     try:
         tgf = await ctx.bot.get_file(doc.file_id)
         await tgf.download_to_drive(str(dst))
     except Exception as e:
-        await update.message.reply_text(f"❌ download: {e}", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, f"❌ download: {e}", reply_markup=reply_kb(uid))
         return ConversationHandler.END
 
     if ext == ".zip":
         ed = (ws / f"extracted_{int(time.time())}").resolve(); ed.mkdir(exist_ok=True)
         ok, msg = unzip(dst, ed)
         if not ok:
-            await update.message.reply_text(f"❌ {msg}", reply_markup=reply_kb(uid))
+            await safe_reply(update.message, f"❌ {msg}", reply_markup=reply_kb(uid))
             return ConversationHandler.END
         lang, entry = find_entry(ed)
         if not entry:
-            await update.message.reply_text("❌ no entry point", reply_markup=reply_kb(uid))
+            await safe_reply(update.message, "❌ no entry point", reply_markup=reply_kb(uid))
             return ConversationHandler.END
         dep_ok, dep_msg = await install_manifest(ed)
         sid = await _store_script(uid, entry, lang, entry.name)
-        await update.message.reply_text(
+        await safe_reply(update.message,
             f"{'✅' if dep_ok else '⚠️'} `{entry.name}` ({lang})\n🆔 `{sid}`\n_{dep_msg}_",
             parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid))
     else:
         lang = lang_of(dst)
         sid = await _store_script(uid, dst, lang, safe)
-        await update.message.reply_text(
+        await safe_reply(update.message,
             f"✅ `{safe}` ({lang})\n🆔 `{sid}`",
             parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid))
     return ConversationHandler.END
 
+@shield
 async def up_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Terminal ---
@@ -869,55 +1015,52 @@ ALLOWED = {"pwd", "ls", "dir", "cd", "cat", "type", "head", "tail", "mkdir", "cp
            "mv", "move", "rm", "del", "grep", "find", "findstr", "wc", "stat", "du",
            "touch", "echo", "which", "where"}
 
+@shield
 async def term_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌ not approved", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, "❌ not approved", reply_markup=reply_kb(uid))
         return ConversationHandler.END
     ws = ws_of(uid); ctx.user_data["term_cwd"] = str(ws)
-    await update.message.reply_text(
+    await safe_reply(update.message,
         banner("💻 Terminal") + f"\n\n📁 `{ws}`\n\n"
         f"allowed: `{', '.join(sorted(ALLOWED))}`\n"
-        "exit: /cancel · /exit · or press any menu button\n"
-        + divider(),
+        "exit: /cancel · /exit · or press any menu button\n" + divider(),
         parse_mode=ParseMode.MARKDOWN)
     return TERM_SESSION
 
+@shield
 async def term_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = (update.message.text or "").strip()
-    if not txt:
-        return TERM_SESSION
+    if not txt: return TERM_SESSION
 
-    # ---- ESCAPE: menu button press exits terminal cleanly + dispatches ----
+    # ---- ESCAPE: menu button during terminal → exit + dispatch ----
     if txt in BTN_TEXTS:
-        if txt == BTN_DEPLOY:       await on_deploy(update, ctx)
-        elif txt == BTN_LOGS:       await on_logs(update, ctx)
-        elif txt == BTN_STATS:      await on_stats(update, ctx)
-        elif txt == BTN_STOP:       await on_stop_all(update, ctx)
-        elif txt == BTN_FILES:      await on_files(update, ctx)
+        if txt == BTN_DEPLOY:    await on_deploy(update, ctx)
+        elif txt == BTN_LOGS:    await on_logs(update, ctx)
+        elif txt == BTN_STATS:   await on_stats(update, ctx)
+        elif txt == BTN_STOP:    await on_stop_all(update, ctx)
+        elif txt == BTN_FILES:   await on_files(update, ctx)
         elif txt == BTN_ADMIN and uid in ADMIN_IDS:
             await on_admin_panel(update, ctx)
         elif txt in (BTN_UPLOAD, BTN_TERM):
-            await update.message.reply_text("🚪 terminal closed — press again to open",
-                                            reply_markup=reply_kb(uid))
+            await safe_reply(update.message, "🚪 terminal closed — press again to open",
+                             reply_markup=reply_kb(uid))
         return ConversationHandler.END
 
-    # ---- ESCAPE: text command ----
     if txt.lower() in ("/cancel", "/exit", "/quit", "exit", "quit"):
-        await update.message.reply_text("🚪 terminal closed", reply_markup=reply_kb(uid))
+        await safe_reply(update.message, "🚪 terminal closed", reply_markup=reply_kb(uid))
         return ConversationHandler.END
 
-    # ---- command parse ----
     try:
         parts = shlex.split(txt, posix=not IS_WIN)
     except ValueError as e:
-        await update.message.reply_text(f"❌ {e}"); return TERM_SESSION
-    if not parts:
-        return TERM_SESSION
+        await safe_reply(update.message, f"❌ {e}"); return TERM_SESSION
+    if not parts: return TERM_SESSION
     cmd = parts[0].lower()
     if cmd not in ALLOWED:
-        await update.message.reply_text(f"❌ `{cmd}` not allowed", parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, f"❌ `{cmd}` not allowed", parse_mode=ParseMode.MARKDOWN)
         return TERM_SESSION
 
     cwd = Path(ctx.user_data.get("term_cwd", str(ws_of(uid))))
@@ -927,13 +1070,14 @@ async def term_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             t = t.resolve()
             if not inside(uid, t) or not t.is_dir():
-                await update.message.reply_text("❌ cannot cd there"); return TERM_SESSION
+                await safe_reply(update.message, "❌ cannot cd there"); return TERM_SESSION
             ctx.user_data["term_cwd"] = str(t)
-            await update.message.reply_text(f"📁 `{t}`", parse_mode=ParseMode.MARKDOWN)
+            await safe_reply(update.message, f"📁 `{t}`", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
+            await safe_reply(update.message, f"❌ {e}")
         return TERM_SESSION
 
+    proc = None
     try:
         env = os.environ.copy(); env["PYTHONIOENCODING"] = "utf-8"; env["PYTHONUTF8"] = "1"
         proc = await asyncio.create_subprocess_exec(*parts, cwd=str(cwd),
@@ -941,92 +1085,104 @@ async def term_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         so, se = await asyncio.wait_for(proc.communicate(), timeout=30)
         out = (so.decode(errors="replace") + se.decode(errors="replace")) or "(no output)"
         if len(out) > 3800: out = out[:3800] + "\n…"
-        await update.message.reply_text(f"```\n{out}\n```", parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, f"```\n{out}\n```", parse_mode=ParseMode.MARKDOWN)
     except asyncio.TimeoutError:
-        proc.terminate(); await update.message.reply_text("❌ timed out")
+        if proc:
+            try: proc.terminate()
+            except Exception: pass
+        await safe_reply(update.message, "❌ timed out")
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await safe_reply(update.message, f"❌ {e}")
     return TERM_SESSION
 
+@shield
 async def term_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚪 terminal closed", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "🚪 terminal closed", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Edit ---
+@shield
 async def edit_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sedit_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return ConversationHandler.END
+        await safe_edit(q, "❌"); return ConversationHandler.END
     ctx.user_data["edit_sid"] = sid
-    await q.edit_message_text(f"✏️ send new full content for `{s['filename']}`\n/cancel to abort",
-                              parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, f"✏️ send new full content for `{s['filename']}`\n/cancel to abort",
+                    parse_mode=ParseMode.MARKDOWN)
     return EDIT_WAIT
 
+@shield
 async def edit_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = ctx.user_data.get("edit_sid"); s = SCRIPTS.get(sid) if sid else None
     if not s:
-        await update.message.reply_text("❌ lost", reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, "❌ lost", reply_markup=reply_kb(update.effective_user.id))
         return ConversationHandler.END
     try:
         Path(s["path"]).write_text(update.message.text or "", encoding="utf-8")
-        await update.message.reply_text("✅ saved", reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, "✅ saved", reply_markup=reply_kb(update.effective_user.id))
         if (sup := SUPERVISORS.get(sid)) and sup.running():
             await sup.stop(); await sup.start(ctx.bot)
-            await update.message.reply_text("🔄 restarted")
+            await safe_reply(update.message, "🔄 restarted")
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await safe_reply(update.message, f"❌ {e}")
     return ConversationHandler.END
 
+@shield
 async def edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Broadcast ---
+@shield
 async def bc_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return ConversationHandler.END
-    await q.edit_message_text("📢 send broadcast text\n/cancel to abort")
+        await safe_edit(q, "❌"); return ConversationHandler.END
+    await safe_edit(q, "📢 send broadcast text\n/cancel to abort")
     return BC_WAIT
 
+@shield
 async def bc_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text or ""
     if not txt:
-        await update.message.reply_text("❌ empty"); return BC_WAIT
+        await safe_reply(update.message, "❌ empty"); return BC_WAIT
     sent = 0
     for k, u in USERS.items():
         if u["status"] == "approved":
-            try: await ctx.bot.send_message(int(k), f"📢 {txt}"); sent += 1
-            except Exception: pass
-    await update.message.reply_text(f"✅ sent {sent}", reply_markup=reply_kb(update.effective_user.id))
+            r = await safe_send(ctx.bot, int(k), f"📢 {txt}")
+            if r: sent += 1
+    await safe_reply(update.message, f"✅ sent {sent}", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
+@shield
 async def bc_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Env ---
+@shield
 async def env_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("senv_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return ConversationHandler.END
+        await safe_edit(q, "❌"); return ConversationHandler.END
     ctx.user_data["env_sid"] = sid
     cur = s.get("env", {})
     body = "\n".join(f"`{k}`=`{v}`" for k, v in cur.items()) if cur else "(none)"
-    await q.edit_message_text(
+    await safe_edit(q,
         f"⚙️ *Env vars* for `{s['filename']}`\n\ncurrent:\n{body}\n\n"
         "Send `KEY=VALUE` per line to replace.\nOr send `-` to clear all.\n/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN)
     return ENV_WAIT
 
+@shield
 async def env_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = ctx.user_data.get("env_sid"); s = SCRIPTS.get(sid) if sid else None
     if not s:
-        await update.message.reply_text("❌ lost", reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, "❌ lost", reply_markup=reply_kb(update.effective_user.id))
         return ConversationHandler.END
     txt = update.message.text or ""
     if txt.strip() == "-":
@@ -1040,88 +1196,98 @@ async def env_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["env"] = env
     persist()
     if sup := SUPERVISORS.get(sid): sup.env = s["env"]
-    await update.message.reply_text(f"✅ saved {len(s['env'])} var(s)",
-                                    reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, f"✅ saved {len(s['env'])} var(s)",
+                     reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
+@shield
 async def env_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Live Input ---
+@shield
 async def input_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sinput_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return ConversationHandler.END
+        await safe_edit(q, "❌"); return ConversationHandler.END
     sup = SUPERVISORS.get(sid)
     if not sup or not sup.running():
-        await q.edit_message_text("❌ not running"); return ConversationHandler.END
+        await safe_edit(q, "❌ not running"); return ConversationHandler.END
     ctx.user_data["input_sid"] = sid
-    await q.edit_message_text(f"📥 send text to pipe into `{s['filename']}` stdin\n/cancel to abort",
-                              parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, f"📥 send text to pipe into `{s['filename']}` stdin\n/cancel to abort",
+                    parse_mode=ParseMode.MARKDOWN)
     return INPUT_WAIT
 
+@shield
 async def input_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = ctx.user_data.get("input_sid")
     sup = SUPERVISORS.get(sid) if sid else None
     if not sup:
-        await update.message.reply_text("❌ lost", reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, "❌ lost", reply_markup=reply_kb(update.effective_user.id))
         return ConversationHandler.END
     ok = sup.send_input(update.message.text or "")
-    await update.message.reply_text("✅ sent" if ok else "❌ write failed",
-                                    reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "✅ sent" if ok else "❌ write failed",
+                     reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
+@shield
 async def input_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- Schedule ---
+@shield
 async def sch_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("ssch_", "", 1)
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        await q.edit_message_text("❌"); return ConversationHandler.END
+        await safe_edit(q, "❌"); return ConversationHandler.END
     ctx.user_data["sch_sid"] = sid
     cur = s.get("interval")
-    await q.edit_message_text(
+    await safe_edit(q,
         f"⏰ *Schedule* `{s['filename']}`\n\n"
         f"current: {f'every {cur}s' if cur else 'off'}\n\n"
         "Send interval in seconds (min 30), or `0` to disable.\n/cancel to abort.",
         parse_mode=ParseMode.MARKDOWN)
     return SCH_WAIT
 
+@shield
 async def sch_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = ctx.user_data.get("sch_sid"); s = SCRIPTS.get(sid) if sid else None
     if not s:
-        await update.message.reply_text("❌ lost", reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, "❌ lost", reply_markup=reply_kb(update.effective_user.id))
         return ConversationHandler.END
     try:
         n = int((update.message.text or "").strip())
         if n == 0:
             s["interval"] = None
         elif n < 30:
-            await update.message.reply_text("❌ min 30s"); return SCH_WAIT
+            await safe_reply(update.message, "❌ min 30s"); return SCH_WAIT
         else:
             s["interval"] = n; s["last_run"] = 0
         persist()
-        await update.message.reply_text(f"✅ interval: {s.get('interval') or 'off'}",
-                                        reply_markup=reply_kb(update.effective_user.id))
+        await safe_reply(update.message, f"✅ interval: {s.get('interval') or 'off'}",
+                         reply_markup=reply_kb(update.effective_user.id))
     except ValueError:
-        await update.message.reply_text("❌ send a number"); return SCH_WAIT
+        await safe_reply(update.message, "❌ send a number"); return SCH_WAIT
     return ConversationHandler.END
 
+@shield
 async def sch_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("cancelled", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
 # --- File Manager ---
 def _file_rows(uid, sub=""):
     root = ws_of(uid); base = (root / sub).resolve() if sub else root
-    if not str(base).startswith(str(root)): base = root
+    try:
+        if not str(base).startswith(str(root)): base = root
+    except Exception:
+        base = root
     rows = []
     if base != root:
         parent = str(base.relative_to(root).parent)
@@ -1131,58 +1297,66 @@ def _file_rows(uid, sub=""):
     except Exception:
         items = []
     for p in items[:40]:
-        if p.is_dir():
-            rel = p.relative_to(root)
-            rows.append([InlineKeyboardButton(f"📁  {p.name}", callback_data=f"fm_{rel}")])
-        else:
-            size = p.stat().st_size if p.exists() else 0
-            rows.append([InlineKeyboardButton(f"📄  {p.name} ({size}B)",
-                                              callback_data=f"fmview_{p.relative_to(root)}")])
+        try:
+            if p.is_dir():
+                rel = p.relative_to(root)
+                rows.append([InlineKeyboardButton(f"📁  {p.name}", callback_data=f"fm_{rel}")])
+            else:
+                size = p.stat().st_size if p.exists() else 0
+                rows.append([InlineKeyboardButton(f"📄  {p.name} ({size}B)",
+                                                  callback_data=f"fmview_{p.relative_to(root)}")])
+        except Exception:
+            continue
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
     return rows
 
+@shield
 async def on_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌ not approved", reply_markup=reply_kb(uid)); return
-    await update.message.reply_text(banner("📂 Files") + f"\n\n📁 `{ws_of(uid)}`",
-                                    parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=InlineKeyboardMarkup(_file_rows(uid)))
+        await safe_reply(update.message, "❌ not approved", reply_markup=reply_kb(uid)); return
+    await safe_reply(update.message, banner("📂 Files") + f"\n\n📁 `{ws_of(uid)}`",
+                     parse_mode=ParseMode.MARKDOWN,
+                     reply_markup=InlineKeyboardMarkup(_file_rows(uid)))
 
+@shield
 async def fm_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sub = q.data.replace("fm_", "", 1)
-    await q.edit_message_text(banner(f"📂 /{sub}" if sub else "📂 Files"),
-                              reply_markup=InlineKeyboardMarkup(_file_rows(q.from_user.id, sub)))
+    await safe_edit(q, banner(f"📂 /{sub}" if sub else "📂 Files"),
+                    reply_markup=InlineKeyboardMarkup(_file_rows(q.from_user.id, sub)))
 
+@shield
 async def fm_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     rel = q.data.replace("fmview_", "", 1)
     p = (ws_of(q.from_user.id) / rel).resolve()
     if not inside(q.from_user.id, p) or not p.exists() or p.is_dir():
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     try:
         c = p.read_text(encoding="utf-8", errors="replace")[:3000]
-        await q.edit_message_text(f"👁 `{rel}`\n\n```\n{c}\n```", parse_mode=ParseMode.MARKDOWN,
+        await safe_edit(q, f"👁 `{rel}`\n\n```\n{c}\n```", parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="fm_")]]))
     except Exception as e:
-        await q.edit_message_text(f"❌ {e}")
+        await safe_edit(q, f"❌ {e}")
 
 # ==================== LOGS / STATS / STOP ====================
+@shield
 async def on_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌"); return
+        await safe_reply(update.message, "❌"); return
     scripts = user_scripts(uid)
     if not scripts:
-        await update.message.reply_text("📜 no logs", reply_markup=reply_kb(uid)); return
+        await safe_reply(update.message, "📜 no logs", reply_markup=reply_kb(uid)); return
     rows = [[InlineKeyboardButton(f"📄  {s['filename']}", callback_data=f"slog_{s['sid']}")] for s in scripts]
-    await update.message.reply_text(banner("📜 Logs"), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_reply(update.message, banner("📜 Logs"), reply_markup=InlineKeyboardMarkup(rows))
 
+@shield
 async def on_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        await update.message.reply_text("❌"); return
+        await safe_reply(update.message, "❌"); return
     scripts = user_scripts(uid)
     lines = [banner("📊 Stats"), ""]
     for s in scripts:
@@ -1194,20 +1368,22 @@ async def on_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"⚪ `{s['filename']}` stopped")
     if not scripts: lines.append("(no scripts)")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid))
+    await safe_reply(update.message, "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid))
 
+@shield
 async def on_stop_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     owned = [sid for sid, sup in SUPERVISORS.items() if sup.uid == uid]
     for sid in owned:
         await SUPERVISORS[sid].stop()
-    await update.message.reply_text(f"🛑 stopped {len(owned)}", reply_markup=reply_kb(uid))
+    await safe_reply(update.message, f"🛑 stopped {len(owned)}", reply_markup=reply_kb(uid))
 
 # ==================== ADMIN ====================
+@shield
 async def on_admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
-        await update.message.reply_text("❌ not admin"); return
+        await safe_reply(update.message, "❌ not admin"); return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Users",     callback_data="a_users"),
          InlineKeyboardButton("⏳ Pending",   callback_data="a_pending")],
@@ -1218,102 +1394,123 @@ async def on_admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🧹 Cleanup",   callback_data="a_cleanup"),
          InlineKeyboardButton("💣 Nuke All",  callback_data="a_nuke")],
     ])
-    await update.message.reply_text(banner("👑 Admin Panel"), reply_markup=kb)
+    await safe_reply(update.message, banner("👑 Admin Panel"), reply_markup=kb)
 
+@shield
 async def a_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     rows = [f"• {u['name']} — `{k}`" for k, u in USERS.items() if u["status"] == "approved"]
-    await q.edit_message_text(banner("👥 Approved") + "\n\n" + ("\n".join(rows) or "none"),
-                              parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, banner("👥 Approved") + "\n\n" + ("\n".join(rows) or "none"),
+                    parse_mode=ParseMode.MARKDOWN)
 
+@shield
 async def a_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     pend = [(k, v) for k, v in USERS.items() if v["status"] == "pending"]
     if not pend:
-        await q.edit_message_text("none pending"); return
+        await safe_edit(q, "none pending"); return
     rows = [[InlineKeyboardButton(v['name'], callback_data=f"a_p_{k}")] for k, v in pend]
-    await q.edit_message_text(banner("⏳ Pending"), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_edit(q, banner("⏳ Pending"), reply_markup=InlineKeyboardMarkup(rows))
 
+@shield
 async def a_p_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
-    uid = int(q.data.replace("a_p_", ""))
+        await safe_edit(q, "❌"); return
+    try:
+        uid = int(q.data.replace("a_p_", ""))
+    except ValueError:
+        await safe_edit(q, "bad id"); return
     u = USERS.get(str(uid))
     if not u:
-        await q.edit_message_text("gone"); return
-    await q.edit_message_text(f"👤 {u['name']} (@{u['username']})\n🆔 `{uid}`",
+        await safe_edit(q, "gone"); return
+    await safe_edit(q, f"👤 {u['name']} (@{u['username']})\n🆔 `{uid}`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
             InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}")]]))
 
+@shield
 async def approve_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
-    uid = int(q.data.split("_")[1])
+        await safe_edit(q, "❌"); return
+    try:
+        uid = int(q.data.split("_")[1])
+    except (ValueError, IndexError):
+        await safe_edit(q, "bad"); return
     if approve(uid):
-        await q.edit_message_text(f"✅ approved `{uid}`", parse_mode=ParseMode.MARKDOWN)
-        try: await ctx.bot.send_message(uid, "✅ access granted", reply_markup=reply_kb(uid))
-        except Exception: pass
+        await safe_edit(q, f"✅ approved `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_send(ctx.bot, uid, "✅ access granted", reply_markup=reply_kb(uid))
 
+@shield
 async def ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
-    uid = int(q.data.split("_")[1])
+        await safe_edit(q, "❌"); return
+    try:
+        uid = int(q.data.split("_")[1])
+    except (ValueError, IndexError):
+        await safe_edit(q, "bad"); return
     if ban(uid):
         for sid, sup in list(SUPERVISORS.items()):
             if sup.uid == uid: await sup.stop()
-        await q.edit_message_text(f"🚫 banned `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(q, f"🚫 banned `{uid}`", parse_mode=ParseMode.MARKDOWN)
 
+@shield
 async def a_running(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     run = [s for s in SUPERVISORS.values() if s.running()]
     if not run:
-        await q.edit_message_text("none running"); return
+        await safe_edit(q, "none running"); return
     txt = banner("🖥 Running") + "\n\n" + "\n".join(
         f"• `{s.path.name}` PID `{s.proc.pid}` user `{s.uid}` ♻️{s.restarts}" for s in run)
-    await q.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN)
 
+@shield
 async def a_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
-    await q.edit_message_text(
+        await safe_edit(q, "❌"); return
+    await safe_edit(q,
         banner("📊 Stats") + f"\n\n👥 users: {len(USERS)}\n📁 scripts: {len(SCRIPTS)}\n"
         f"🖥 running: {sum(1 for s in SUPERVISORS.values() if s.running())}",
         parse_mode=ParseMode.MARKDOWN)
 
+@shield
 async def a_banned(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     rows = [(k, v) for k, v in USERS.items() if v["status"] == "banned"]
     if not rows:
-        await q.edit_message_text("none"); return
+        await safe_edit(q, "none"); return
     kb = [[InlineKeyboardButton(f"unban {v['name']}", callback_data=f"unban_{k}")] for k, v in rows]
-    await q.edit_message_text(banner("🚫 Banned"), reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit(q, banner("🚫 Banned"), reply_markup=InlineKeyboardMarkup(kb))
 
+@shield
 async def unban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
-    uid = int(q.data.split("_")[1])
+        await safe_edit(q, "❌"); return
+    try:
+        uid = int(q.data.split("_")[1])
+    except (ValueError, IndexError):
+        await safe_edit(q, "bad"); return
     if unban(uid):
-        await q.edit_message_text(f"✅ unbanned `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(q, f"✅ unbanned `{uid}`", parse_mode=ParseMode.MARKDOWN)
 
+@shield
 async def a_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     cutoff = datetime.now() - timedelta(days=7); n = 0
     for ws in WORKSPACE.iterdir():
         if ws.is_dir():
@@ -1322,21 +1519,19 @@ async def a_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if datetime.fromtimestamp(lg.stat().st_mtime) < cutoff:
                         lg.unlink(); n += 1
                 except Exception: pass
-    await q.edit_message_text(f"🧹 removed {n}")
+    await safe_edit(q, f"🧹 removed {n}")
 
+@shield
 async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("❌"); return
+        await safe_edit(q, "❌"); return
     for sid, sup in list(SUPERVISORS.items()):
         await sup.stop(); SUPERVISORS.pop(sid, None)
     n = len(SCRIPTS); SCRIPTS.clear(); persist()
-    await q.edit_message_text(f"💣 nuked {n} script(s)", parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, f"💣 nuked {n} script(s)", parse_mode=ParseMode.MARKDOWN)
 
-# ==================== ERROR / FLASK / WATCHDOG / BOOT ====================
-async def on_err(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    print(f"[SHADOW] err: {ctx.error}")
-
+# ==================== FLASK / WATCHDOG / BOOT ====================
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -1346,7 +1541,10 @@ def health():
                     "running": sum(1 for s in SUPERVISORS.values() if s.running())})
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    try:
+        flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    except Exception as e:
+        log.warning("flask: %s", e)
 
 async def watchdog(bot):
     while True:
@@ -1361,10 +1559,13 @@ async def watchdog(bot):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"[WD] {e}")
+            log.warning("[WD] %s", e)
 
 async def post_init(app: Application):
-    await app.bot.set_my_commands([BotCommand("start", "🌑 Start"), BotCommand("help", "ℹ️ Help")])
+    try:
+        await app.bot.set_my_commands([BotCommand("start", "🌑 Start"), BotCommand("help", "ℹ️ Help")])
+    except Exception as e:
+        log.warning("set_my_commands: %s", e)
     asyncio.create_task(watchdog(app.bot))
     asyncio.create_task(scheduler_loop())
     for sid, s in list(SCRIPTS.items()):
@@ -1375,11 +1576,19 @@ async def post_init(app: Application):
         SUPERVISORS[sid] = sup
         try: await sup.start(app.bot)
         except Exception as e:
-            print(f"[restore] {sid}: {e}")
+            log.warning("[restore] %s: %s", sid, e)
 
 def main():
     Thread(target=run_flask, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(post_init)
+           .read_timeout(30)
+           .write_timeout(30)
+           .connect_timeout(15)
+           .pool_timeout(5)
+           .get_updates_read_timeout(30)
+           .build())
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1426,43 +1635,50 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_FILES]),  on_files))
     app.add_handler(MessageHandler(filters.Text([BTN_ADMIN]),  on_admin_panel))
 
-    app.add_handler(CallbackQueryHandler(check_join,    pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(main_menu_cb,  pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(deploy_list,   pattern="^deploy_list$"))
-    app.add_handler(CallbackQueryHandler(script_view,   pattern="^sview_"))
-    app.add_handler(CallbackQueryHandler(script_start,  pattern="^sstart_"))
-    app.add_handler(CallbackQueryHandler(script_stop,   pattern="^sstop_"))
+    app.add_handler(CallbackQueryHandler(check_join,     pattern="^check_join$"))
+    app.add_handler(CallbackQueryHandler(main_menu_cb,   pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(deploy_list,    pattern="^deploy_list$"))
+    app.add_handler(CallbackQueryHandler(script_view,    pattern="^sview_"))
+    app.add_handler(CallbackQueryHandler(script_start,   pattern="^sstart_"))
+    app.add_handler(CallbackQueryHandler(script_stop,    pattern="^sstop_"))
     app.add_handler(CallbackQueryHandler(script_restart, pattern="^srestart_"))
-    app.add_handler(CallbackQueryHandler(script_auto,   pattern="^sauto_"))
-    app.add_handler(CallbackQueryHandler(script_del,    pattern="^sdel_"))
-    app.add_handler(CallbackQueryHandler(script_log,    pattern="^slog_"))
-    app.add_handler(CallbackQueryHandler(script_code,   pattern="^scode_"))
-    app.add_handler(CallbackQueryHandler(fm_browse,     pattern="^fm_"))
-    app.add_handler(CallbackQueryHandler(fm_view,       pattern="^fmview_"))
+    app.add_handler(CallbackQueryHandler(script_auto,    pattern="^sauto_"))
+    app.add_handler(CallbackQueryHandler(script_del,     pattern="^sdel_"))
+    app.add_handler(CallbackQueryHandler(script_log,     pattern="^slog_"))
+    app.add_handler(CallbackQueryHandler(script_code,    pattern="^scode_"))
+    app.add_handler(CallbackQueryHandler(fm_browse,      pattern="^fm_"))
+    app.add_handler(CallbackQueryHandler(fm_view,        pattern="^fmview_"))
 
-    app.add_handler(CallbackQueryHandler(a_users,     pattern="^a_users$"))
-    app.add_handler(CallbackQueryHandler(a_pending,   pattern="^a_pending$"))
-    app.add_handler(CallbackQueryHandler(a_p_detail,  pattern="^a_p_"))
-    app.add_handler(CallbackQueryHandler(approve_cb,  pattern="^approve_"))
-    app.add_handler(CallbackQueryHandler(ban_cb,      pattern="^ban_"))
-    app.add_handler(CallbackQueryHandler(a_running,   pattern="^a_running$"))
-    app.add_handler(CallbackQueryHandler(a_stats,     pattern="^a_stats$"))
-    app.add_handler(CallbackQueryHandler(a_banned,    pattern="^a_banned$"))
-    app.add_handler(CallbackQueryHandler(unban_cb,    pattern="^unban_"))
-    app.add_handler(CallbackQueryHandler(a_cleanup,   pattern="^a_cleanup$"))
-    app.add_handler(CallbackQueryHandler(a_nuke,      pattern="^a_nuke$"))
+    app.add_handler(CallbackQueryHandler(a_users,    pattern="^a_users$"))
+    app.add_handler(CallbackQueryHandler(a_pending,  pattern="^a_pending$"))
+    app.add_handler(CallbackQueryHandler(a_p_detail, pattern="^a_p_"))
+    app.add_handler(CallbackQueryHandler(approve_cb, pattern="^approve_"))
+    app.add_handler(CallbackQueryHandler(ban_cb,     pattern="^ban_"))
+    app.add_handler(CallbackQueryHandler(a_running,  pattern="^a_running$"))
+    app.add_handler(CallbackQueryHandler(a_stats,    pattern="^a_stats$"))
+    app.add_handler(CallbackQueryHandler(a_banned,   pattern="^a_banned$"))
+    app.add_handler(CallbackQueryHandler(unban_cb,   pattern="^unban_"))
+    app.add_handler(CallbackQueryHandler(a_cleanup,  pattern="^a_cleanup$"))
+    app.add_handler(CallbackQueryHandler(a_nuke,     pattern="^a_nuke$"))
 
-    app.add_error_handler(on_err)
-    print(f"[{BRAND}] booting…")
+    app.add_error_handler(on_error)
+    log.info("[SHADOW] booting…")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
+    backoff = 5
     while True:
         try:
-            main(); break
+            main()
+            backoff = 5
+            break
         except KeyboardInterrupt:
-            print("\n[SHADOW] bye"); break
+            log.info("[SHADOW] bye")
+            break
+        except Conflict:
+            log.error("[SHADOW] TOKEN CONFLICT — same token polling elsewhere. sleep 60s")
+            time.sleep(60)
         except Exception:
-            print("[SHADOW] FATAL — restarting in 5s")
-            traceback.print_exc()
-            time.sleep(5)
+            log.exception("[SHADOW] FATAL — restarting in %ss", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
