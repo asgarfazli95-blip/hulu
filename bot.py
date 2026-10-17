@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-𝐒𝐇𝐀𝐃𝐎𝐖 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 v9
+𝐒𝐇𝐀𝐃𝐎𝐖 𝐇𝐎𝐒𝐓𝐈𝐍𝐆 v11 (FULL)
 - Resilience layer: safe_reply / safe_edit / safe_send / shield / on_error
 - Terminal escape: menu button during TERM_SESSION exits cleanly + dispatches
 - UTF-8 forced on Windows (cp1252 fix)
 - env vars · live stdin · scheduler · file manager
 - auto-restore on boot · crash notify · self-restart with backoff
+- Auto-installs all required pip packages on boot
 - NO token fallback — BOT_TOKEN must come from env
 """
 
@@ -22,13 +23,33 @@ except Exception:
 
 def _boot():
     need = []
-    for mod, pkg in [("telegram", "python-telegram-bot"), ("dotenv", "python-dotenv"),
-                     ("psutil", "psutil"), ("flask", "flask")]:
-        try: __import__(mod)
-        except ImportError: need.append(pkg)
+    pkgs = [
+        ("telegram",  "python-telegram-bot>=21"),
+        ("dotenv",    "python-dotenv"),
+        ("psutil",    "psutil"),
+        ("flask",     "flask"),
+        ("requests",  "requests"),
+        ("telethon",  "telethon"),
+        ("yt_dlp",    "yt-dlp"),
+        ("gtts",      "gTTS"),
+        ("edge_tts",  "edge-tts"),
+        ("openai",    "openai"),
+    ]
+    
+    for mod, pkg in pkgs:
+        try:
+            __import__(mod)
+        except ImportError:
+            need.append(pkg)
+            
     if need:
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *need])
+        print(f"[SHADOW] Installing missing packages: {', '.join(need)}")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", *need])
+        except Exception as e:
+            print(f"[SHADOW] pip install failed: {e}", file=sys.stderr)
+
 try:
     _boot()
 except Exception as e:
