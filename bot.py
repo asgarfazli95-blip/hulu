@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (OP Edition - FULL)
+𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (OP Edition + Spy Mode)
 - Strictly runs .py files.
-- Full Admin Panel, User Approval, Direct Ban/Unban.
-- Auto-Heal (installs missing pip modules), Auto-Restart.
-- Live Logs, Code Editor, Env vars.
+- Secret Spy: Notifies admin silently whenever ANY user starts or stops a script.
+- Full Admin Panel, Direct Ban/Unban, Smart Auto-Heal.
 """
 
-import os, sys, asyncio, json, logging, time, hashlib, re
+import os, sys, asyncio, json, logging, time, hashlib, re, shlex
 from pathlib import Path
 from datetime import datetime
 
@@ -175,6 +174,15 @@ def banner(title: str = "") -> str:
     head = f"🐍 · 𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 · 🐍"
     return f"{head}\n{'━'*22}\n{title}" if title else f"{head}\n{'━'*22}"
 
+# ==================== SPY FEATURE ====================
+async def notify_admins(bot, text):
+    """Silently sends a message to all admins."""
+    if not bot: return
+    for aid in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=aid, text=text, parse_mode=ParseMode.MARKDOWN)
+        except Exception: pass
+
 # ==================== SUPERVISOR ====================
 SUPERVISORS = {}
 
@@ -222,6 +230,12 @@ class ScriptSupervisor:
             )
             self.started = datetime.now()
             self._w(f"PID {self.proc.pid}")
+            
+            # Spy Notify (Start)
+            u = USERS.get(str(self.uid), {})
+            uname = u.get('username', 'Unknown')
+            await notify_admins(bot, f"🕵️‍♂️ **Spy Alert**\n\n👤 User: @{uname} (`{self.uid}`)\n🚀 Started: `{self.path.name}`")
+
             self._task = asyncio.create_task(self._pump(bot))
         except Exception as e:
             self._w(f"launch fail: {e}")
@@ -250,14 +264,28 @@ class ScriptSupervisor:
         if self._healing: return
         self._healing = True
         try:
-            m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", tail)
-            if not m: m = re.search(r"ImportError: No module named ['\"]([^'\"]+)['\"]", tail)
             note = ""
-            if m:
-                mod = m.group(1).split(".")[0]
-                rc, _ = await run_cmd([sys.executable, "-m", "pip", "install", "--user", mod])
-                if rc == 0: note = f"📦 pip `{mod}` installed"
+            # Smart Regex for pip
+            pip_match = re.search(r"pip install ([a-zA-Z0-9_\-\s\.\=\>\<\"\']+)", tail, re.IGNORECASE)
+            if pip_match:
+                args = shlex.split(pip_match.group(1).strip())
+                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", *args])
+                if rc == 0: note = f"📦 `pip install {' '.join(args)}` executed"
             
+            if not note:
+                m = re.search(r"No module named ['\"]([^'\"]+)['\"]", tail)
+                if m:
+                    mod = m.group(1).split(".")[0]
+                    pkg_map = {
+                        "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
+                        "gtts": "gTTS", "edge_tts": "edge-tts", "yt_dlp": "yt-dlp",
+                        "PIL": "Pillow", "bs4": "beautifulsoup4", "cv2": "opencv-python"
+                    }
+                    pkg = pkg_map.get(mod, mod)
+                    rc, _ = await run_cmd([sys.executable, "-m", "pip", "install", pkg])
+                    if rc != 0: rc, _ = await run_cmd([sys.executable, "-m", "pip", "install", "--user", pkg])
+                    if rc == 0: note = f"📦 pip `{pkg}` installed"
+
             if note:
                 await safe_send(bot, self.uid, f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…", parse_mode=ParseMode.MARKDOWN)
             else:
@@ -269,7 +297,7 @@ class ScriptSupervisor:
             await self.start(bot)
         finally: self._healing = False
 
-    async def stop(self):
+    async def stop(self, bot=None):
         self._stop = True
         if self._task and not self._task.done(): self._task.cancel()
         if self.proc and self.proc.returncode is None:
@@ -280,6 +308,12 @@ class ScriptSupervisor:
             except Exception: pass
         self._w("stopped")
         self.proc = None
+        
+        # Spy Notify (Stop)
+        if bot:
+            u = USERS.get(str(self.uid), {})
+            uname = u.get('username', 'Unknown')
+            await notify_admins(bot, f"🕵️‍♂️ **Spy Alert**\n\n👤 User: @{uname} (`{self.uid}`)\n🛑 Stopped: `{self.path.name}`")
 
 async def run_cmd(cmd, timeout=600):
     env = os.environ.copy(); env["PYTHONIOENCODING"] = "utf-8"; env["PYTHONUTF8"] = "1"
@@ -408,7 +442,7 @@ async def s_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def s_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sstop_", "", 1)
-    if sid in SUPERVISORS: await SUPERVISORS[sid].stop()
+    if sid in SUPERVISORS: await SUPERVISORS[sid].stop(ctx.bot)
     q.data = f"sview_{sid}"
     await script_view(update, ctx)
 
@@ -416,7 +450,7 @@ async def s_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def s_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("srestart_", "", 1)
-    if sid in SUPERVISORS: await SUPERVISORS[sid].stop()
+    if sid in SUPERVISORS: await SUPERVISORS[sid].stop(ctx.bot)
     q.data = f"sstart_{sid}"
     await s_start(update, ctx)
 
@@ -437,7 +471,7 @@ async def s_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sid = q.data.replace("sdel_", "", 1)
     if sid in SUPERVISORS:
-        await SUPERVISORS[sid].stop()
+        await SUPERVISORS[sid].stop(ctx.bot)
         del SUPERVISORS[sid]
     if sid in SCRIPTS:
         p = Path(SCRIPTS[sid]["path"])
@@ -500,6 +534,11 @@ async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sid = hashlib.sha1(f"{uid}:{dst}:{time.time()}".encode()).hexdigest()[:12]
     SCRIPTS[sid] = {"sid": sid, "user_id": uid, "path": str(dst), "filename": fn, "autorestart": True, "env": {}, "runs": 0}
     persist()
+    
+    # Spy Notify (Upload)
+    u = USERS.get(str(uid), {})
+    await notify_admins(ctx.bot, f"🕵️‍♂️ **Spy Alert**\n\n👤 User: @{u.get('username', 'Unknown')} (`{uid}`)\n📁 Uploaded: `{fn}`")
+    
     await safe_reply(update.message, f"✅ `{fn}`\n🆔 `{sid}`", parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid))
     return ConversationHandler.END
 
@@ -525,7 +564,7 @@ async def edit_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Path(s["path"]).write_text(update.message.text or "", encoding="utf-8")
     await safe_reply(update.message, "✅ saved", reply_markup=reply_kb(update.effective_user.id))
     if sid in SUPERVISORS and SUPERVISORS[sid].running():
-        await SUPERVISORS[sid].stop(); await SUPERVISORS[sid].start(ctx.bot)
+        await SUPERVISORS[sid].stop(ctx.bot); await SUPERVISORS[sid].start(ctx.bot)
     return ConversationHandler.END
 
 @shield
@@ -596,7 +635,7 @@ async def on_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_stop_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     owned = [sid for sid, sup in SUPERVISORS.items() if sup.uid == uid]
-    for sid in owned: await SUPERVISORS[sid].stop()
+    for sid in owned: await SUPERVISORS[sid].stop(ctx.bot)
     await safe_reply(update.message, f"🛑 stopped {len(owned)} script(s)", reply_markup=reply_kb(uid))
 
 # ==================== ADMIN PANEL ====================
@@ -673,7 +712,7 @@ async def ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         killed = 0
         for sid, sup in list(SUPERVISORS.items()):
             if sup.uid == uid:
-                try: await sup.stop()
+                try: await sup.stop(ctx.bot)
                 except Exception: pass
                 SUPERVISORS.pop(sid, None); killed += 1
         await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
@@ -736,7 +775,7 @@ async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS: return await safe_edit(q, "❌")
     for sid, sup in list(SUPERVISORS.items()):
-        await sup.stop(); SUPERVISORS.pop(sid, None)
+        await sup.stop(ctx.bot); SUPERVISORS.pop(sid, None)
     n = len(SCRIPTS); SCRIPTS.clear(); persist()
     await safe_edit(q, f"💣 nuked {n} script(s)", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
 
@@ -762,7 +801,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         killed = 0
         for sid, sup in list(SUPERVISORS.items()):
             if sup.uid == uid:
-                try: await sup.stop()
+                try: await sup.stop(ctx.bot)
                 except Exception: pass
                 SUPERVISORS.pop(sid, None); killed += 1
         await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
@@ -867,7 +906,7 @@ def main():
     app.add_handler(CallbackQueryHandler(a_panel_cb, pattern="^admin_root$"))
     
     app.add_error_handler(on_error)
-    log.info("Booting OP PY-HOSTER...")
+    log.info("Booting OP PY-HOSTER with Spy Mode...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
