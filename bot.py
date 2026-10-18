@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (OP Edition + Spy Mode)
+𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (High-Level OP Edition)
 - Strictly runs .py files.
-- Secret Spy: Notifies admin silently whenever ANY user starts or stops a script.
-- Full Admin Panel, Direct Ban/Unban, Smart Auto-Heal.
+- Secret Spy: Notifies admin on every Upload/Start/Stop.
+- Bulletproof Auto-Heal: Parses custom pip messages, installs all missing deps with versions.
+- Full Admin Panel: Approve, Ban, Unban, Nuke, Broadcast.
 """
 
 import os, sys, asyncio, json, logging, time, hashlib, re, shlex
 from pathlib import Path
 from datetime import datetime
 
-# ==================== AUTO-INSTALL DEPENDENCIES ====================
+# ==================== AUTO-INSTALL CORE ====================
 def _boot():
     pkgs = [
         ("telegram", "python-telegram-bot>=21"),
@@ -23,14 +24,14 @@ def _boot():
         except ImportError: need.append(pkg)
     if need:
         import subprocess
-        print(f"[PYHOST] Installing missing packages: {', '.join(need)}")
+        print(f"[PYHOST] Installing missing core packages: {', '.join(need)}")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", *need])
         except Exception as e:
-            print(f"[PYHOST] pip install failed: {e}", file=sys.stderr)
+            print(f"[PYHOST] Core pip install failed: {e}", file=sys.stderr)
 
 try: _boot()
-except Exception as e: print(f"[PYHOST] boot deps failed: {e}", file=sys.stderr)
+except Exception as e: print(f"[PYHOST] Boot deps failed: {e}", file=sys.stderr)
 
 import psutil
 from dotenv import load_dotenv
@@ -176,11 +177,9 @@ def banner(title: str = "") -> str:
 
 # ==================== SPY FEATURE ====================
 async def notify_admins(bot, text):
-    """Silently sends a message to all admins."""
     if not bot: return
     for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(chat_id=aid, text=text, parse_mode=ParseMode.MARKDOWN)
+        try: await bot.send_message(chat_id=aid, text=text, parse_mode=ParseMode.MARKDOWN)
         except Exception: pass
 
 # ==================== SUPERVISOR ====================
@@ -231,7 +230,6 @@ class ScriptSupervisor:
             self.started = datetime.now()
             self._w(f"PID {self.proc.pid}")
             
-            # Spy Notify (Start)
             u = USERS.get(str(self.uid), {})
             uname = u.get('username', 'Unknown')
             await notify_admins(bot, f"🕵️‍♂️ **Spy Alert**\n\n👤 User: @{uname} (`{self.uid}`)\n🚀 Started: `{self.path.name}`")
@@ -264,27 +262,52 @@ class ScriptSupervisor:
         if self._healing: return
         self._healing = True
         try:
-            note = ""
-            # Smart Regex for pip
-            pip_match = re.search(r"pip install ([a-zA-Z0-9_\-\s\.\=\>\<\"\']+)", tail, re.IGNORECASE)
-            if pip_match:
-                args = shlex.split(pip_match.group(1).strip())
-                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", *args])
-                if rc == 0: note = f"📦 `pip install {' '.join(args)}` executed"
+            pkgs_to_install = set()
             
-            if not note:
-                m = re.search(r"No module named ['\"]([^'\"]+)['\"]", tail)
-                if m:
-                    mod = m.group(1).split(".")[0]
-                    pkg_map = {
-                        "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
-                        "gtts": "gTTS", "edge_tts": "edge-tts", "yt_dlp": "yt-dlp",
-                        "PIL": "Pillow", "bs4": "beautifulsoup4", "cv2": "opencv-python"
-                    }
-                    pkg = pkg_map.get(mod, mod)
-                    rc, _ = await run_cmd([sys.executable, "-m", "pip", "install", pkg])
-                    if rc != 0: rc, _ = await run_cmd([sys.executable, "-m", "pip", "install", "--user", pkg])
-                    if rc == 0: note = f"📦 pip `{pkg}` installed"
+            # 1. Extract packages from ANY "pip install" line
+            pip_matches = re.findall(r"pip install (.+)", tail)
+            for match in pip_matches:
+                # Split by space, clean up quotes and brackets
+                for part in match.split():
+                    part = part.strip("'\"")
+                    if part and not part.startswith("-") and part not in ("pip", "install", "-U", "-r"):
+                        pkgs_to_install.add(part)
+            
+            # 2. Extract standard missing modules
+            mod_matches = re.findall(r"No module named ['\"]([^'\"]+)['\"]", tail)
+            for mod in mod_matches:
+                mod = mod.split(".")[0]
+                pkg_map = {
+                    "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
+                    "gtts": "gTTS", "edge_tts": "edge-tts", "yt_dlp": "yt-dlp",
+                    "PIL": "Pillow", "bs4": "beautifulsoup4", "cv2": "opencv-python"
+                }
+                pkgs_to_install.add(pkg_map.get(mod, mod))
+                
+            success_pkgs = []
+            failed_pkgs = []
+            pip_logs = []
+            
+            for pkg in pkgs_to_install:
+                if not pkg or pkg.startswith("-"): continue
+                
+                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", pkg])
+                if rc == 0:
+                    success_pkgs.append(pkg)
+                    continue
+                    
+                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", "--user", pkg])
+                if rc == 0:
+                    success_pkgs.append(pkg)
+                else:
+                    failed_pkgs.append(pkg)
+                    pip_logs.append(f"[{pkg}]\n{out[-300:]}")
+
+            note = ""
+            if success_pkgs:
+                note += f"📦 Installed: `{'`, `'.join(success_pkgs)}`\n"
+            if failed_pkgs:
+                note += f"❌ Failed: `{'`, `'.join(failed_pkgs)}`\n```\n" + "\n".join(pip_logs) + "\n```"
 
             if note:
                 await safe_send(bot, self.uid, f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…", parse_mode=ParseMode.MARKDOWN)
@@ -309,7 +332,6 @@ class ScriptSupervisor:
         self._w("stopped")
         self.proc = None
         
-        # Spy Notify (Stop)
         if bot:
             u = USERS.get(str(self.uid), {})
             uname = u.get('username', 'Unknown')
@@ -356,7 +378,7 @@ def reply_kb(uid):
     if uid in ADMIN_IDS: rows.append([BTN_ADMIN])
     return ReplyKeyboardMarkup([[KeyboardButton(b) for b in r] for r in rows], resize_keyboard=True, is_persistent=True)
 
-# ==================== START ====================
+# ==================== HANDLERS ====================
 @shield
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -373,7 +395,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_pend(uid): return await safe_reply(update.message, "⏳ pending")
     await safe_reply(update.message, banner(f"👋 welcome {name}"), reply_markup=reply_kb(uid))
 
-# ==================== DEPLOY & SCRIPT VIEW ====================
 async def _deploy_rows(uid):
     rows = []
     for s in user_scripts(uid):
@@ -423,7 +444,6 @@ async def script_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb.append([InlineKeyboardButton("🔙 Back", callback_data="deploy_list")])
     await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
 
-# ==================== SCRIPT ACTIONS ====================
 @shield
 async def s_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -535,7 +555,6 @@ async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     SCRIPTS[sid] = {"sid": sid, "user_id": uid, "path": str(dst), "filename": fn, "autorestart": True, "env": {}, "runs": 0}
     persist()
     
-    # Spy Notify (Upload)
     u = USERS.get(str(uid), {})
     await notify_admins(ctx.bot, f"🕵️‍♂️ **Spy Alert**\n\n👤 User: @{u.get('username', 'Unknown')} (`{uid}`)\n📁 Uploaded: `{fn}`")
     
@@ -606,7 +625,6 @@ async def env_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, "cancelled", reply_markup=reply_kb(update.effective_user.id))
     return ConversationHandler.END
 
-# ==================== STATS / LOGS / STOP ====================
 @shield
 async def on_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -790,7 +808,6 @@ async def a_panel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ])
     await safe_edit(q, banner("👑 Admin Panel"), reply_markup=kb)
 
-# ==================== COMMANDS ====================
 @shield
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -906,7 +923,7 @@ def main():
     app.add_handler(CallbackQueryHandler(a_panel_cb, pattern="^admin_root$"))
     
     app.add_error_handler(on_error)
-    log.info("Booting OP PY-HOSTER with Spy Mode...")
+    log.info("Booting OP PY-HOSTER...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
