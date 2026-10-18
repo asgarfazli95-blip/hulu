@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (High-Level OP Edition - FINAL v3)
+▸ PYHOST v4
 - Strictly runs .py files.
 - Pre-flight import resolver scans script source BEFORE launch.
-- Bulletproof auto-heal: source-scan -> tail-hint -> fallback batch.
-- Local-module awareness: never pip-installs helper files sitting next to the script.
-- Idempotent callback answers: no BadRequest spam on chained button presses.
-- Secret Spy: notifies admin on every Upload/Start/Stop.
-- Full Admin Panel: Approve, Ban, Unban, Nuke, Broadcast.
+- Every install verified by real subprocess import (find_spec lies).
+- ensure_pip bootstrap if pip itself is broken.
+- Local-module awareness: never pip-installs helper files next to the script.
+- /diag dumps ground truth about the interpreter + pip state.
+- Admin panel, spy alerts, autorestart, watchdog — all intact.
 """
 
 import os
@@ -22,62 +22,84 @@ import importlib.util
 from pathlib import Path
 from datetime import datetime
 
-# ==================== AUTO-INSTALL CORE ====================
+# ==================== CORE BOOT ====================
 def _boot_core():
     pkgs = [
         ("telegram", "python-telegram-bot>=21"),
         ("dotenv", "python-dotenv"),
         ("psutil", "psutil"),
+        ("requests", "requests"),
     ]
+
+    import subprocess
+
+    # 1. Ensure pip itself exists. If pip is broken, ensurepip fixes it.
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            capture_output=True, timeout=20,
+        )
+        if r.returncode != 0:
+            print("[PYHOST] pip missing — bootstrapping via ensurepip")
+            subprocess.run(
+                [sys.executable, "-m", "ensurepip", "--default-pip"],
+                check=False, timeout=90,
+            )
+    except Exception as e:
+        print(f"[PYHOST] pip probe failed: {e}", file=sys.stderr)
+
+    # 2. Install any missing core packages.
     need = []
     for mod, pkg in pkgs:
         try:
             __import__(mod)
         except ImportError:
             need.append(pkg)
+
     if need:
-        import subprocess
-        print(f"[PYHOST] Installing missing core packages: {', '.join(need)}")
+        print(f"[PYHOST] Installing core: {', '.join(need)}")
+        for flags in (["-U"], ["-U", "--user"], ["-U", "--break-system-packages"]):
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet", *flags, *need],
+                    check=True, timeout=300,
+                )
+                break
+            except subprocess.CalledProcessError as e:
+                print(f"[PYHOST] pip {flags} failed: {e}", file=sys.stderr)
+            except subprocess.TimeoutExpired:
+                print(f"[PYHOST] pip {flags} timed out", file=sys.stderr)
+
+    # 3. Re-verify with real imports.
+    for mod, pkg in pkgs:
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-U", "--quiet", *need]
+            __import__(mod)
+        except ImportError:
+            print(
+                f"[PYHOST] FATAL: {mod} ({pkg}) still not importable.\n"
+                f"  Manual: {sys.executable} -m pip install {pkg}",
+                file=sys.stderr,
             )
-        except Exception as e:
-            print(f"[PYHOST] Core pip install failed: {e}", file=sys.stderr)
 
 try:
     _boot_core()
 except Exception as e:
-    print(f"[PYHOST] Boot deps failed: {e}", file=sys.stderr)
+    print(f"[PYHOST] Boot failed: {e}", file=sys.stderr)
 
 import psutil
 from dotenv import load_dotenv
 from telegram import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    BotCommand,
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton,
+    InlineKeyboardMarkup, Update, BotCommand,
 )
 from telegram.constants import ParseMode
 from telegram.error import (
-    BadRequest,
-    Forbidden,
-    RetryAfter,
-    TimedOut,
-    NetworkError,
-    TelegramError,
-    Conflict,
+    BadRequest, Forbidden, RetryAfter, TimedOut,
+    NetworkError, TelegramError, Conflict,
 )
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
+    Application, CallbackQueryHandler, CommandHandler,
+    ConversationHandler, MessageHandler, filters, ContextTypes,
 )
 
 # ==================== LOGGING ====================
@@ -90,7 +112,7 @@ if not log.handlers:
     log.addHandler(_h)
 log.setLevel(logging.INFO)
 
-# ==================== RESILIENCE LAYER ====================
+# ==================== RESILIENCE ====================
 RETRY_MAX = 3
 RETRY_BASE = 1.5
 RETRYABLE = (TimedOut, NetworkError, RetryAfter)
@@ -186,7 +208,6 @@ async def safe_send(bot, chat_id, text, **kwargs):
 
 
 async def _answer(q):
-    """Idempotent callback answer — safe to call on a query already answered."""
     try:
         await q.answer()
     except Exception:
@@ -199,14 +220,13 @@ async def _nudge(update, context):
             await _answer(update.callback_query)
         chat_id = (
             update.effective_chat.id
-            if getattr(update, "effective_chat", None)
-            else None
+            if getattr(update, "effective_chat", None) else None
         )
         if not chat_id and getattr(update, "callback_query", None):
             chat_id = update.callback_query.from_user.id
         if chat_id:
             await context.bot.send_message(
-                chat_id=chat_id, text="⚠️ action hiccuped — try again"
+                chat_id=chat_id, text="⚠ hiccup — try again"
             )
     except Exception:
         pass
@@ -237,15 +257,12 @@ def shield(fn):
 async def on_error(update, context):
     err = context.error
     if isinstance(err, Conflict):
-        log.error("POLLING CONFLICT: %s", err)
-        return
+        log.error("POLLING CONFLICT: %s", err); return
     if isinstance(err, RetryAfter):
-        await asyncio.sleep(float(err.retry_after) + 0.5)
-        return
+        await asyncio.sleep(float(err.retry_after) + 0.5); return
     if isinstance(err, (BadRequest, Forbidden)):
-        log.warning("error soft: %s", err)
-        return
-    log.exception("error handler:", exc_info=err)
+        log.warning("soft error: %s", err); return
+    log.exception("error:", exc_info=err)
     await _nudge(update, context)
 
 
@@ -266,6 +283,31 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 DATA_FILE = WORKSPACE / "shadow_data.json"
 LOG_CAP = 10 * 1024 * 1024
 WATCHDOG = 5
+
+
+# ==================== UI PRIMITIVES ====================
+BRAND = "▸ PYHOST"
+RULE = "━" * 17
+
+
+def banner(title: str = "") -> str:
+    if title:
+        return f"{BRAND} · {title}\n{RULE}"
+    return f"{BRAND}\n{RULE}"
+
+
+def _trunc(s: str, n: int = 26) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def state_dot(up: bool) -> str:
+    return "●" if up else "○"
+
+
+def plural(n: int, one: str, many: str = None) -> str:
+    return one if n == 1 else (many or one + "s")
 
 
 # ==================== IMPORT RESOLVER ====================
@@ -323,15 +365,6 @@ IMPORT_TO_PKG = {
 }
 
 
-def is_importable(name: str) -> bool:
-    if not name or name in STDLIB:
-        return True
-    try:
-        return importlib.util.find_spec(name) is not None
-    except Exception:
-        return False
-
-
 def parse_imports(source: str):
     """Extract top-level module names from import / from-import statements."""
     names = set()
@@ -382,12 +415,7 @@ def persist():
         log.warning("persist: %s", e)
 
 
-def banner(title: str = "") -> str:
-    head = "🐍 · 𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 · 🐍"
-    return f"{head}\n{'━' * 22}\n{title}" if title else f"{head}\n{'━' * 22}"
-
-
-# ==================== SPY FEATURE ====================
+# ==================== SPY ====================
 async def notify_admins(bot, text):
     if not bot:
         return
@@ -435,19 +463,36 @@ async def run_cmd(cmd, timeout=600):
         return -1, str(e)
 
 
+async def verify_import(mod: str, timeout: int = 20) -> bool:
+    """Authoritative: actually import the module in a fresh subprocess."""
+    rc, _ = await run_cmd([sys.executable, "-c", f"import {mod}"], timeout=timeout)
+    return rc == 0
+
+
+async def ensure_pip() -> bool:
+    rc, _ = await run_cmd([sys.executable, "-m", "pip", "--version"], timeout=20)
+    if rc == 0:
+        return True
+    await run_cmd(
+        [sys.executable, "-m", "ensurepip", "--default-pip"], timeout=90
+    )
+    rc, _ = await run_cmd([sys.executable, "-m", "pip", "--version"], timeout=20)
+    return rc == 0
+
+
 async def pip_install(pkg: str, timeout: int = 300):
     strategies = [
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+        ["-m", "pip", "install", "--disable-pip-version-check",
          "--no-input", "--quiet", pkg],
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+        ["-m", "pip", "install", "--disable-pip-version-check",
          "--no-input", "--quiet", "--user", pkg],
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-         "--no-input", "--quiet", "--break-system-packages", pkg],
+        ["-m", "pip", "install", "--disable-pip-version-check",
+         "--no-input", "--break-system-packages", pkg],
     ]
     logs = []
     last_rc = -1
-    for cmd in strategies:
-        rc, out = await run_cmd(cmd, timeout=timeout)
+    for flags in strategies:
+        rc, out = await run_cmd([sys.executable, *flags], timeout=timeout)
         logs.append(f"$ pip install {pkg}\n{out}")
         last_rc = rc
         if rc == 0:
@@ -510,25 +555,27 @@ class ScriptSupervisor:
         imported = parse_imports(source_text)
         missing = sorted(
             m for m in imported
-            if not is_importable(m) and not self._is_local(m)
+            if m not in STDLIB
+            and not self._is_local(m)
+            and not await verify_import(m)
         )
         installed, failed, logs = [], [], []
         for mod in missing:
             pkg = IMPORT_TO_PKG.get(mod, mod)
-            self._w(f"pip: installing {mod} as {pkg}")
+            self._w(f"pip: {mod} → {pkg}")
             rc, out = await pip_install(pkg)
-            if rc == 0 and is_importable(mod):
+            if rc == 0 and await verify_import(mod):
                 installed.append(pkg)
                 continue
             alt = mod.lower()
             if alt != pkg.lower():
-                self._w(f"pip: fallback {mod} as {alt}")
+                self._w(f"pip: {mod} → {alt} (fallback)")
                 rc2, out2 = await pip_install(alt)
-                if rc2 == 0 and is_importable(mod):
+                if rc2 == 0 and await verify_import(mod):
                     installed.append(alt)
                     continue
             failed.append(mod)
-            logs.append(f"[{mod}] {out[-300:]}")
+            logs.append(f"[{mod}] rc={rc}\n{out[-400:]}")
         return installed, failed, "\n".join(logs)
 
     async def pre_heal(self, bot=None) -> str:
@@ -539,24 +586,24 @@ class ScriptSupervisor:
             return ""
         installed, failed, _ = await self._install_missing(src)
         if installed:
-            self._w(f"pre_heal installed: {installed}")
+            self._w(f"pre_heal ✓ {installed}")
         if failed:
-            self._w(f"pre_heal failed: {failed}")
-        note = ""
-        if installed:
-            note += f"📦 Pre-installed: `{'`, `'.join(installed)}`\n"
-        if failed:
-            note += f"❌ Pre-heal failed: `{'`, `'.join(failed)}`\n"
-        if bot and note:
+            self._w(f"pre_heal ✕ {failed}")
+        if bot and (installed or failed):
+            note = ""
+            if installed:
+                note += f"✓  installed  `{'`, `'.join(installed)}`\n"
+            if failed:
+                note += f"✕  failed     `{'`, `'.join(failed)}`\n"
             try:
                 await safe_send(
                     bot, self.uid,
-                    f"🩹 *pre-heal* · `{self.path.name}`\n{note}",
+                    banner(f"pre-heal · {self.path.name}") + f"\n\n{note}",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
                 pass
-        return note
+        return ""
 
     async def start(self, bot=None):
         if self.running():
@@ -569,7 +616,7 @@ class ScriptSupervisor:
             self._w(f"pre_heal crash: {e}")
 
         if self._stop:
-            self._w("start aborted — stop requested mid pre-heal")
+            self._w("start aborted — stopped mid pre-heal")
             return
 
         env = os.environ.copy()
@@ -579,7 +626,7 @@ class ScriptSupervisor:
         env.update(self.env)
 
         try:
-            self._w(f"launching {self.path}")
+            self._w(f"launch {self.path}")
             self.proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-u", str(self.path),
                 cwd=str(self.path.parent),
@@ -589,17 +636,15 @@ class ScriptSupervisor:
                 env=env,
             )
             self.started = datetime.now()
-            self._w(f"PID {self.proc.pid}")
+            self._w(f"pid {self.proc.pid}")
 
             u = USERS.get(str(self.uid), {})
-            uname = u.get("username", "Unknown")
+            uname = u.get("username", "unknown")
             await notify_admins(
                 bot,
-                f"🕵️‍♂️ **Spy Alert**\n\n"
-                f"👤 User: @{uname} (`{self.uid}`)\n"
-                f"🚀 Started: `{self.path.name}`",
+                banner(f"start · {self.path.name}")
+                + f"\n\n@{uname}  ·  `{self.uid}`",
             )
-
             self._task = asyncio.create_task(self._pump(bot))
         except Exception as e:
             self._w(f"launch fail: {e}")
@@ -615,8 +660,7 @@ class ScriptSupervisor:
                     if not ln:
                         break
                     t = ln.decode(errors="replace")
-                    lf.write(t)
-                    lf.flush()
+                    lf.write(t); lf.flush()
                     tail.append(t)
                     if len(tail) > 300:
                         tail = tail[-300:]
@@ -630,7 +674,7 @@ class ScriptSupervisor:
                     await self.proc.wait()
                 except Exception:
                     pass
-                self._w(f"exited {self.proc.returncode}")
+                self._w(f"exit {self.proc.returncode}")
             tail_text = "".join(tail[-120:])
             if self.auto and not self._stop and bot:
                 await self._heal(bot, tail_text)
@@ -642,26 +686,25 @@ class ScriptSupervisor:
         try:
             installed, failed, pip_log = [], [], ""
 
-            # 1. SOURCE SCAN — authoritative
+            # 1. Source scan
             try:
                 src = self.path.read_text(encoding="utf-8", errors="replace")
                 installed, failed, pip_log = await self._install_missing(src)
             except Exception as e:
                 self._w(f"heal rescan: {e}")
 
-            # 2. TAIL HINTS — dynamic imports the source scan can't see
+            # 2. Tail hints
             hinted = set()
             for m in re.findall(r"pip\s+install\s+(.+)", tail):
                 for part in m.replace('"', "").replace("'", "").split():
                     if (
-                        part
-                        and not part.startswith("-")
+                        part and not part.startswith("-")
                         and part not in ("pip", "install", "-U", "-r", "-m")
                     ):
                         hinted.add(part)
             for mod in re.findall(r"No module named ['\"]([^'\"]+)['\"]", tail):
-                mod_top = mod.split(".")[0]
-                hinted.add(IMPORT_TO_PKG.get(mod_top, mod_top))
+                top = mod.split(".")[0]
+                hinted.add(IMPORT_TO_PKG.get(top, top))
 
             def _base(p):
                 return p.split(">=")[0].split("==")[0].split("<")[0].lower()
@@ -672,51 +715,46 @@ class ScriptSupervisor:
                     continue
                 if _base(pkg) in have:
                     continue
-                self._w(f"pip (from tail): {pkg}")
+                self._w(f"pip (tail): {pkg}")
                 rc, out = await pip_install(pkg)
                 if rc == 0:
                     installed.append(pkg)
                 else:
                     failed.append(pkg)
-                    pip_log += f"\n[{pkg}] {out[-300:]}"
+                    pip_log += f"\n[{pkg}] rc={rc}\n{out[-400:]}"
 
-            # 3. FALLBACK batch — only when both scans came up empty
+            # 3. Fallback batch
             if not installed and not failed and (
                 "missing dep" in tail or "No module named" in tail
             ):
                 self._w("heal: fallback batch")
                 for pkg in (
-                    "requests",
-                    "python-telegram-bot>=21",
-                    "telethon",
-                    "yt-dlp",
-                    "gTTS",
-                    "edge-tts",
+                    "requests", "python-telegram-bot>=21",
+                    "telethon", "yt-dlp", "gTTS", "edge-tts",
                 ):
                     rc, out = await pip_install(pkg)
                     if rc == 0:
                         installed.append(pkg)
                     else:
                         failed.append(pkg)
-                        pip_log += f"\n[{pkg}] {out[-200:]}"
+                        pip_log += f"\n[{pkg}] rc={rc}\n{out[-200:]}"
 
             note = ""
             if installed:
-                note += f"📦 Installed: `{'`, `'.join(dict.fromkeys(installed))}`\n"
+                note += f"✓  installed  `{'`, `'.join(dict.fromkeys(installed))}`\n"
             if failed:
-                note += f"❌ Failed: `{'`, `'.join(dict.fromkeys(failed))}`\n"
+                note += f"✕  failed     `{'`, `'.join(dict.fromkeys(failed))}`\n"
             if not note:
-                note = f"⚠️ Could not identify missing deps.\n```\n{tail[-400:]}\n```\n"
+                note = f"⚠  unresolved\n```\n{tail[-400:]}\n```\n"
             if pip_log:
-                note += f"\n```\n{pip_log[-600:]}\n```\n"
+                note += f"\n```\n{pip_log[-800:]}\n```\n"
 
             await safe_send(
                 bot, self.uid,
-                f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…",
+                banner(f"heal · {self.path.name}") + f"\n\n{note}restarting…",
                 parse_mode=ParseMode.MARKDOWN,
             )
 
-            # Reset healing flag BEFORE restart so a boot-crash can re-heal.
             self._healing = False
             self.restarts += 1
             await asyncio.sleep(min(self.backoff, 60))
@@ -744,12 +782,11 @@ class ScriptSupervisor:
 
         if bot:
             u = USERS.get(str(self.uid), {})
-            uname = u.get("username", "Unknown")
+            uname = u.get("username", "unknown")
             await notify_admins(
                 bot,
-                f"🕵️‍♂️ **Spy Alert**\n\n"
-                f"👤 User: @{uname} (`{self.uid}`)\n"
-                f"🛑 Stopped: `{self.path.name}`",
+                banner(f"stop · {self.path.name}")
+                + f"\n\n@{uname}  ·  `{self.uid}`",
             )
 
 
@@ -810,18 +847,21 @@ def ws_of(uid):
     return w
 
 
-# ==================== UI ====================
-BTN_DEPLOY = "🚀 Deploy"
-BTN_UPLOAD = "📁 Upload"
-BTN_LOGS = "📜 Logs"
-BTN_STATS = "📊 Stats"
-BTN_STOP = "🛑 Stop All"
-BTN_ADMIN = "👑 Admin Panel"
-BTN_TEXTS = {BTN_DEPLOY, BTN_UPLOAD, BTN_LOGS, BTN_STATS, BTN_STOP, BTN_ADMIN}
+# ==================== KEYBOARD ====================
+BTN_SCRIPTS = "Scripts"
+BTN_UPLOAD = "Upload"
+BTN_LOGS = "Logs"
+BTN_STATS = "Stats"
+BTN_STOP = "Stop All"
+BTN_ADMIN = "Admin"
 
 
 def reply_kb(uid):
-    rows = [[BTN_DEPLOY, BTN_UPLOAD], [BTN_LOGS, BTN_STATS], [BTN_STOP]]
+    rows = [
+        [BTN_SCRIPTS, BTN_UPLOAD],
+        [BTN_LOGS, BTN_STATS],
+        [BTN_STOP],
+    ]
     if uid in ADMIN_IDS:
         rows.append([BTN_ADMIN])
     return ReplyKeyboardMarkup(
@@ -831,64 +871,71 @@ def reply_kb(uid):
     )
 
 
-# ==================== RENDER HELPERS ====================
+# ==================== RENDER ====================
 async def _render_deploy_list(q):
     rows = []
     for s in user_scripts(q.from_user.id):
         sup = SUPERVISORS.get(s["sid"])
-        dot = "🟢" if (sup and sup.running()) else "⚪"
-        rows.append(
-            [InlineKeyboardButton(
-                f"{dot}  {s['filename']}",
-                callback_data=f"sview_{s['sid']}",
-            )]
-        )
+        up = bool(sup and sup.running())
+        label = f"{state_dot(up)}  {_trunc(s['filename'], 28)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sview_{s['sid']}")])
     if not rows:
-        return await safe_edit(q, "no scripts")
-    await safe_edit(q, banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
+        rows.append([InlineKeyboardButton("Upload a script to begin", callback_data="noop")])
+    await safe_edit(
+        q, banner("scripts"), reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def _render_script_view(q, sid):
     s = SCRIPTS.get(sid)
     if not s or s["user_id"] != q.from_user.id:
-        return await safe_edit(q, "❌ not found")
+        return await safe_edit(q, "script not found")
+
     sup = SUPERVISORS.get(sid)
-    run = sup.running() if sup else False
-    pid = sup.proc.pid if sup and run else "—"
-    auto = "♻️ ON" if s.get("autorestart", True) else "⛔ OFF"
+    up = sup.running() if sup else False
+    pid = sup.proc.pid if (sup and up) else "—"
+    auto = "on" if s.get("autorestart", True) else "off"
+    restarts = sup.restarts if sup else 0
     st = sup.stats() if sup else None
-    stats_line = f"\n📈 CPU `{st['cpu']}%` · RAM `{st['mem']}MB`" if st else ""
+
+    state = "● running" if up else "○ stopped"
+    if st:
+        load = f"{st['cpu']}%  ·  {st['mem']} MB"
+    else:
+        load = "—"
 
     txt = (
-        banner(f"📄 {s['filename']}") + "\n\n"
-        f"🆔 `{sid}`\n"
-        f"📊 {'🟢 RUNNING' if run else '⚪ STOPPED'}\n"
-        f"🔢 PID `{pid}`\n"
-        f"♻️ Auto: {auto}\n"
-        f"🔄 Restarts: {sup.restarts if sup else 0}{stats_line}\n"
-        f"📁 `{s['path']}`"
+        banner("script") + "\n\n"
+        f"*{s['filename']}*\n\n"
+        f"state    {state}\n"
+        f"pid      {pid}\n"
+        f"auto     {auto}  ·  {restarts} {plural(restarts, 'restart')}\n"
+        f"load     {load}\n\n"
+        f"`{s['path']}`"
     )
+
     kb = []
-    if run:
+    if up:
         kb.append([
-            InlineKeyboardButton("🔄 Restart", callback_data=f"srestart_{sid}"),
-            InlineKeyboardButton("🛑 Stop", callback_data=f"sstop_{sid}"),
+            InlineKeyboardButton("↻ Restart", callback_data=f"srestart_{sid}"),
+            InlineKeyboardButton("■ Stop", callback_data=f"sstop_{sid}"),
         ])
     else:
-        kb.append([InlineKeyboardButton("🚀 Start", callback_data=f"sstart_{sid}")])
+        kb.append([InlineKeyboardButton("▶ Start", callback_data=f"sstart_{sid}")])
     kb.append([
-        InlineKeyboardButton("📜 Live Log", callback_data=f"slog_{sid}"),
-        InlineKeyboardButton("👁 Code", callback_data=f"scode_{sid}"),
+        InlineKeyboardButton("Logs", callback_data=f"slog_{sid}"),
+        InlineKeyboardButton("Code", callback_data=f"scode_{sid}"),
     ])
     kb.append([
-        InlineKeyboardButton("✏️ Edit", callback_data=f"sedit_{sid}"),
-        InlineKeyboardButton("⚙️ Env", callback_data=f"senv_{sid}"),
+        InlineKeyboardButton("Edit", callback_data=f"sedit_{sid}"),
+        InlineKeyboardButton("Env", callback_data=f"senv_{sid}"),
     ])
     kb.append([
-        InlineKeyboardButton(f"♻️ {auto}", callback_data=f"sauto_{sid}"),
-        InlineKeyboardButton("🗑 Delete", callback_data=f"sdel_{sid}"),
+        InlineKeyboardButton(f"Auto · {auto}", callback_data=f"sauto_{sid}"),
+        InlineKeyboardButton("✕ Delete", callback_data=f"sdel_{sid}"),
     ])
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="deploy_list")])
+    kb.append([InlineKeyboardButton("‹ Back", callback_data="deploy_list")])
+
     await safe_edit(
         q, txt, parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(kb),
@@ -906,47 +953,98 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for aid in ADMIN_IDS:
             await safe_send(
                 ctx.bot, aid,
-                f"🔔 *New Request*\n"
-                f"👤 {name}\n"
-                f"🆔 `{uid}`\n"
-                f"📛 @{uname}",
+                banner("request") + f"\n\n*{name}*\n@{uname}  ·  `{uid}`",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-                    InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{uid}"),
+                    InlineKeyboardButton("✓ Approve", callback_data=f"approve_{uid}"),
+                    InlineKeyboardButton("⊘ Ban", callback_data=f"ban_{uid}"),
                 ]]),
             )
-        return await safe_reply(update.message, banner("✅ request sent to admin"))
+        return await safe_reply(update.message, banner("request sent"))
 
     if is_ban(uid):
-        return await safe_reply(update.message, "🚫 banned")
+        return await safe_reply(update.message, "access revoked")
     if is_pend(uid):
-        return await safe_reply(update.message, "⏳ pending")
-    await safe_reply(update.message, banner(f"👋 welcome {name}"), reply_markup=reply_kb(uid))
+        return await safe_reply(update.message, "awaiting approval")
+    await safe_reply(
+        update.message,
+        banner("welcome") + f"\n\n  {name}\n  ready.",
+        reply_markup=reply_kb(uid),
+    )
+
+
+@shield
+async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return await safe_reply(update.message, "admin only")
+
+    lines = [
+        banner("diagnostics"),
+        f"`{sys.executable}`",
+        f"python `{sys.version.split()[0]}`",
+    ]
+
+    for mod in ("requests", "telegram", "psutil"):
+        spec = None
+        try:
+            spec = importlib.util.find_spec(mod)
+        except Exception:
+            pass
+        spec_str = spec.origin if spec and spec.origin else "(none)"
+        rc, out = await run_cmd(
+            [sys.executable, "-c", f"import {mod}; print({mod}.__file__)"],
+            timeout=15,
+        )
+        mark = "✓" if rc == 0 else "✕"
+        loc = out.strip().splitlines()[-1] if out.strip() else ""
+        lines.append(
+            f"\n*{mod}*  {mark}\n"
+            f"spec `{spec_str}`\n"
+            f"real `{loc or 'FAILED'}`"
+        )
+
+    rc, out = await run_cmd(
+        [sys.executable, "-m", "pip", "show", "requests"], timeout=20
+    )
+    pip_view = out.strip()[:400] if rc == 0 else f"(rc={rc}) {out.strip()[:200]}"
+    lines.append(f"\n*`pip show requests`*\n```\n{pip_view}\n```")
+
+    rc, out = await run_cmd(
+        [sys.executable, "-c", "import sys; print('\\n'.join(sys.path))"],
+        timeout=15,
+    )
+    lines.append(f"\n*`sys.path`*\n```\n{(out.strip()[:600] if rc == 0 else '(failed)')}\n```")
+
+    body = "\n".join(lines)
+    for i in range(0, len(body), 3500):
+        await safe_send(
+            ctx.bot, update.effective_user.id,
+            body[i:i + 3500], parse_mode=ParseMode.MARKDOWN,
+        )
+        await asyncio.sleep(0.3)
 
 
 @shield
 async def on_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_ok(uid):
-        return await safe_reply(update.message, "❌ not approved", reply_markup=reply_kb(uid))
+        return await safe_reply(update.message, "not approved", reply_markup=reply_kb(uid))
     rows = []
     for s in user_scripts(uid):
         sup = SUPERVISORS.get(s["sid"])
-        dot = "🟢" if (sup and sup.running()) else "⚪"
-        rows.append(
-            [InlineKeyboardButton(
-                f"{dot}  {s['filename']}",
-                callback_data=f"sview_{s['sid']}",
-            )]
-        )
+        up = bool(sup and sup.running())
+        label = f"{state_dot(up)}  {_trunc(s['filename'], 28)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sview_{s['sid']}")])
     if not rows:
         return await safe_reply(
             update.message,
-            banner("📂 no scripts") + "\n\nupload one first — tap 📁 Upload",
+            banner("scripts") + "\n\n  no scripts yet — tap Upload",
             reply_markup=reply_kb(uid),
         )
-    await safe_reply(update.message, banner("🚀 Deploy"), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_reply(
+        update.message, banner("scripts"),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 @shield
@@ -1060,16 +1158,16 @@ async def s_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sup = SUPERVISORS.get(sid)
     lp = sup.log if sup else Path(s["path"]).parent / "logs" / f"{sid}.log"
     try:
-        tail = lp.read_text(encoding="utf-8", errors="replace")[-3500:] if lp.exists() else "(No logs yet)"
+        tail = lp.read_text(encoding="utf-8", errors="replace")[-3400:] if lp.exists() else "(no logs yet)"
     except Exception as e:
-        tail = f"Error: {e}"
+        tail = f"error: {e}"
     kb = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"slog_{sid}")],
-        [InlineKeyboardButton("🔙 Back", callback_data=f"sview_{sid}")],
+        [InlineKeyboardButton("↻ Refresh", callback_data=f"slog_{sid}"),
+         InlineKeyboardButton("‹ Back", callback_data=f"sview_{sid}")],
     ]
     await safe_edit(
         q,
-        f"📜 *Logs for {s['filename']}*\n```\n{tail}\n```",
+        banner(f"logs · {_trunc(s['filename'], 20)}") + f"\n```\n{tail}\n```",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -1085,17 +1183,17 @@ async def s_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     try:
         c = Path(s["path"]).read_text(encoding="utf-8", errors="replace")
-        if len(c) > 3500:
-            c = c[:3500] + "\n…"
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data=f"sview_{sid}")]]
+        if len(c) > 3400:
+            c = c[:3400] + "\n…"
+        kb = [[InlineKeyboardButton("‹ Back", callback_data=f"sview_{sid}")]]
         await safe_edit(
             q,
-            f"👁 `{s['filename']}`\n```\n{c}\n```",
+            banner(f"source · {_trunc(s['filename'], 20)}") + f"\n```\n{c}\n```",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(kb),
         )
     except Exception as e:
-        await safe_edit(q, f"❌ {e}")
+        await safe_edit(q, f"error: {e}")
 
 
 # ==================== CONVERSATIONS ====================
@@ -1108,7 +1206,7 @@ async def up_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await safe_reply(
         update.message,
-        banner("📁 Upload") + "\n\nsend a `.py` script\n/cancel to abort",
+        banner("upload") + "\n\n  send a .py file\n  /cancel to abort",
     )
     return UP_WAIT
 
@@ -1123,7 +1221,7 @@ async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return UP_WAIT
     fn = doc.file_name or "file.py"
     if not fn.endswith(".py"):
-        return await safe_reply(update.message, "❌ only `.py` files", reply_markup=reply_kb(uid))
+        return await safe_reply(update.message, "only .py files", reply_markup=reply_kb(uid))
 
     ws = ws_of(uid)
     dst = (ws / fn).resolve()
@@ -1131,7 +1229,7 @@ async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tgf = await ctx.bot.get_file(doc.file_id)
         await tgf.download_to_drive(str(dst))
     except Exception as e:
-        return await safe_reply(update.message, f"❌ download: {e}", reply_markup=reply_kb(uid))
+        return await safe_reply(update.message, f"download failed: {e}", reply_markup=reply_kb(uid))
 
     sid = hashlib.sha1(f"{uid}:{dst}:{time.time()}".encode()).hexdigest()[:12]
     SCRIPTS[sid] = {
@@ -1143,14 +1241,12 @@ async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = USERS.get(str(uid), {})
     await notify_admins(
         ctx.bot,
-        f"🕵️‍♂️ **Spy Alert**\n\n"
-        f"👤 User: @{u.get('username', 'Unknown')} (`{uid}`)\n"
-        f"📁 Uploaded: `{fn}`",
+        banner(f"upload · {_trunc(fn, 24)}")
+        + f"\n\n@{u.get('username', 'unknown')}  ·  `{uid}`",
     )
-
     await safe_reply(
         update.message,
-        f"✅ `{fn}`\n🆔 `{sid}`",
+        banner("uploaded") + f"\n\n  {fn}\n  id  `{sid}`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=reply_kb(uid),
     )
@@ -1174,8 +1270,7 @@ async def edit_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["edit_sid"] = sid
     await safe_edit(
         q,
-        f"✏️ send new full content for `{s['filename']}`\n/cancel to abort",
-        parse_mode=ParseMode.MARKDOWN,
+        banner("edit") + f"\n\n  {s['filename']}\n\n  send new full content\n  /cancel to abort",
     )
     return EDIT_WAIT
 
@@ -1187,7 +1282,7 @@ async def edit_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not s:
         return ConversationHandler.END
     Path(s["path"]).write_text(update.message.text or "", encoding="utf-8")
-    await safe_reply(update.message, "✅ saved", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(update.message, "saved", reply_markup=reply_kb(update.effective_user.id))
     if sid in SUPERVISORS and SUPERVISORS[sid].running():
         await SUPERVISORS[sid].stop(ctx.bot)
         await SUPERVISORS[sid].start(ctx.bot)
@@ -1210,13 +1305,12 @@ async def env_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     ctx.user_data["env_sid"] = sid
     cur = s.get("env", {})
-    body = "\n".join(f"`{k}`=`{v}`" for k, v in cur.items()) if cur else "(none)"
+    body = "\n".join(f"  {k}  =  {v}" for k, v in cur.items()) if cur else "  (none)"
     await safe_edit(
         q,
-        f"⚙️ *Env vars* for `{s['filename']}`\n\n"
-        f"current:\n{body}\n\n"
-        f"Send `KEY=VALUE` per line to replace.\n"
-        f"Or send `-` to clear all.\n/cancel to abort.",
+        banner("env") + f"\n\n  {s['filename']}\n\n{body}\n\n"
+        f"  send KEY=VALUE per line to replace\n"
+        f"  or send `-` to clear all\n  /cancel to abort",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ENV_WAIT
@@ -1241,9 +1335,10 @@ async def env_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     persist()
     if sid in SUPERVISORS:
         SUPERVISORS[sid].env = s["env"]
+    n = len(s["env"])
     await safe_reply(
         update.message,
-        f"✅ saved {len(s['env'])} var(s)",
+        f"saved · {n} {plural(n, 'var')}",
         reply_markup=reply_kb(update.effective_user.id),
     )
     return ConversationHandler.END
@@ -1262,12 +1357,15 @@ async def on_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     scripts = user_scripts(uid)
     if not scripts:
-        return await safe_reply(update.message, "📜 no logs", reply_markup=reply_kb(uid))
+        return await safe_reply(update.message, "no scripts yet", reply_markup=reply_kb(uid))
     rows = [
-        [InlineKeyboardButton(f"📄 {s['filename']}", callback_data=f"slog_{s['sid']}")]
+        [InlineKeyboardButton(_trunc(s['filename'], 28), callback_data=f"slog_{s['sid']}")]
         for s in scripts
     ]
-    await safe_reply(update.message, banner("📜 Logs"), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_reply(
+        update.message, banner("logs"),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 @shield
@@ -1276,21 +1374,25 @@ async def on_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_ok(uid):
         return
     scripts = user_scripts(uid)
-    lines = [banner("📊 Stats"), ""]
+    if not scripts:
+        return await safe_reply(update.message, "no scripts yet", reply_markup=reply_kb(uid))
+
+    blocks = []
     for s in scripts:
         sup = SUPERVISORS.get(s["sid"])
         if sup and sup.running():
             st = sup.stats() or {}
-            lines.append(
-                f"🟢 `{s['filename']}` | PID `{sup.proc.pid}` | "
-                f"CPU `{st.get('cpu', '?')}%` | RAM `{st.get('mem', '?')}MB`"
+            blocks.append(
+                f"●  {s['filename']}\n"
+                f"   pid {sup.proc.pid}  ·  "
+                f"{st.get('cpu', '?')}%  ·  {st.get('mem', '?')} MB"
             )
         else:
-            lines.append(f"⚪ `{s['filename']}` (stopped)")
-    if not scripts:
-        lines.append("(no scripts)")
+            blocks.append(f"○  {s['filename']}\n   stopped")
+
+    txt = banner("stats") + "\n\n" + "\n\n".join(blocks)
     await safe_reply(
-        update.message, "\n".join(lines),
+        update.message, txt,
         parse_mode=ParseMode.MARKDOWN, reply_markup=reply_kb(uid),
     )
 
@@ -1301,23 +1403,40 @@ async def on_stop_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     owned = [sid for sid, sup in SUPERVISORS.items() if sup.uid == uid]
     for sid in owned:
         await SUPERVISORS[sid].stop(ctx.bot)
-    await safe_reply(update.message, f"🛑 stopped {len(owned)} script(s)", reply_markup=reply_kb(uid))
+    await safe_reply(
+        update.message,
+        f"stopped · {len(owned)} {plural(len(owned), 'script')}",
+        reply_markup=reply_kb(uid),
+    )
 
 
-# ==================== ADMIN PANEL ====================
+# ==================== ADMIN ====================
 @shield
 async def on_admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return await safe_reply(update.message, "❌ not admin")
+        return await safe_reply(update.message, "admin only")
+
+    approved_n = sum(1 for v in USERS.values() if v["status"] == "approved")
+    pending_n = sum(1 for v in USERS.values() if v["status"] == "pending")
+    banned_n = sum(1 for v in USERS.values() if v["status"] == "banned")
+    running_n = sum(1 for s in SUPERVISORS.values() if s.running())
+
+    txt = (
+        banner("admin") + "\n\n"
+        f"  users      {approved_n}\n"
+        f"  pending    {pending_n}\n"
+        f"  banned     {banned_n}\n"
+        f"  running    {running_n}"
+    )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Users", callback_data="a_users"),
-         InlineKeyboardButton("⏳ Pending", callback_data="a_pending")],
-        [InlineKeyboardButton("🖥 Running", callback_data="a_running"),
-         InlineKeyboardButton("🚫 Banned", callback_data="a_banned")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="a_broadcast"),
-         InlineKeyboardButton("💣 Nuke All", callback_data="a_nuke")],
+        [InlineKeyboardButton("Users", callback_data="a_users"),
+         InlineKeyboardButton("Pending", callback_data="a_pending")],
+        [InlineKeyboardButton("Running", callback_data="a_running"),
+         InlineKeyboardButton("Banned", callback_data="a_banned")],
+        [InlineKeyboardButton("Broadcast", callback_data="a_broadcast"),
+         InlineKeyboardButton("✕ Nuke All", callback_data="a_nuke")],
     ])
-    await safe_reply(update.message, banner("👑 Admin Panel"), reply_markup=kb)
+    await safe_reply(update.message, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 @shield
@@ -1325,27 +1444,28 @@ async def a_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     approved = [(k, v) for k, v in USERS.items() if v["status"] == "approved"]
     if not approved:
         return await safe_edit(
-            q, "No approved users.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+            q, banner("users") + "\n\n  no approved users",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+            ),
         )
     rows = []
     for k, v in approved:
         rows.append([
             InlineKeyboardButton(
-                f"👤 {v.get('name', '?')[:18]} · {k}",
+                f"{_trunc(v.get('name', '?'), 20)}  ·  {k}",
                 callback_data=f"adetail_{k}",
             ),
-            InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{k}"),
+            InlineKeyboardButton("⊘", callback_data=f"ban_{k}"),
         ])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
+    rows.append([InlineKeyboardButton("‹ Back", callback_data="admin_root")])
     await safe_edit(
         q,
-        banner("👥 Approved Users") + f"\n\n`{len(approved)}` user(s) — tap name to manage or Ban directly",
-        parse_mode=ParseMode.MARKDOWN,
+        banner(f"users · {len(approved)}"),
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -1355,7 +1475,7 @@ async def a_user_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     try:
         uid = int(q.data.replace("adetail_", ""))
     except ValueError:
@@ -1363,15 +1483,21 @@ async def a_user_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = USERS.get(str(uid))
     if not u:
         return await safe_edit(q, "gone")
+
     kb = []
     if u["status"] == "approved":
-        kb.append([InlineKeyboardButton("🚫 Ban Now", callback_data=f"ban_{uid}")])
+        kb.append([InlineKeyboardButton("⊘ Ban", callback_data=f"ban_{uid}")])
     elif u["status"] == "banned":
-        kb.append([InlineKeyboardButton("✅ Unban", callback_data=f"unban_{uid}")])
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="a_users")])
+        kb.append([InlineKeyboardButton("✓ Unban", callback_data=f"unban_{uid}")])
+    kb.append([InlineKeyboardButton("‹ Back", callback_data="a_users")])
+
     await safe_edit(
         q,
-        f"👤 {u['name']} (@{u['username']})\n🆔 `{uid}`\nStatus: `{u['status']}`",
+        banner("user") + f"\n\n"
+        f"*{u['name']}*\n"
+        f"@{u['username']}\n"
+        f"id   `{uid}`\n"
+        f"status   {u['status']}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -1382,16 +1508,28 @@ async def a_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     pend = [(k, v) for k, v in USERS.items() if v["status"] == "pending"]
     if not pend:
         return await safe_edit(
-            q, "none pending",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+            q, banner("pending") + "\n\n  none waiting",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+            ),
         )
-    rows = [[InlineKeyboardButton(v['name'], callback_data=f"a_p_{k}")] for k, v in pend]
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
-    await safe_edit(q, banner("⏳ Pending"), reply_markup=InlineKeyboardMarkup(rows))
+    rows = [
+        [InlineKeyboardButton(
+            f"{_trunc(v.get('name', '?'), 22)}  ·  {k}",
+            callback_data=f"a_p_{k}",
+        )]
+        for k, v in pend
+    ]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data="admin_root")])
+    await safe_edit(
+        q,
+        banner(f"pending · {len(pend)}"),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 @shield
@@ -1399,7 +1537,7 @@ async def a_p_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     try:
         uid = int(q.data.replace("a_p_", ""))
     except ValueError:
@@ -1409,12 +1547,12 @@ async def a_p_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await safe_edit(q, "gone")
     await safe_edit(
         q,
-        f"👤 {u['name']} (@{u['username']})\n🆔 `{uid}`",
+        banner("request") + f"\n\n*{u['name']}*\n@{u['username']}\nid   `{uid}`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-             InlineKeyboardButton("🚫 Ban", callback_data=f"ban_{uid}")],
-            [InlineKeyboardButton("🔙 Back", callback_data="a_pending")],
+            [InlineKeyboardButton("✓ Approve", callback_data=f"approve_{uid}"),
+             InlineKeyboardButton("⊘ Ban", callback_data=f"ban_{uid}")],
+            [InlineKeyboardButton("‹ Back", callback_data="a_pending")],
         ]),
     )
 
@@ -1424,18 +1562,20 @@ async def approve_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     try:
         uid = int(q.data.split("_", 1)[1])
     except (ValueError, IndexError):
         return await safe_edit(q, "bad id")
     if approve(uid):
         await safe_edit(
-            q, f"✅ approved `{uid}`",
+            q, f"approved · `{uid}`",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="a_users")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="a_users")]]
+            ),
         )
-        await safe_send(ctx.bot, uid, "✅ access granted", reply_markup=reply_kb(uid))
+        await safe_send(ctx.bot, uid, "access granted", reply_markup=reply_kb(uid))
 
 
 @shield
@@ -1443,7 +1583,7 @@ async def ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     try:
         uid = int(q.data.split("_", 1)[1])
     except (ValueError, IndexError):
@@ -1458,12 +1598,15 @@ async def ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pass
                 SUPERVISORS.pop(sid, None)
                 killed += 1
-        await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
+        await safe_send(ctx.bot, uid, "access revoked")
         await safe_edit(
             q,
-            f"🚫 *banned* `{uid}`\n🛑 killed `{killed}` script(s)\n\nℹ️ `/unban {uid}` to restore.",
+            f"banned · `{uid}`\n"
+            f"killed · {killed} {plural(killed, 'script')}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="a_users")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="a_users")]]
+            ),
         )
 
 
@@ -1472,19 +1615,28 @@ async def a_banned(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     rows_data = [(k, v) for k, v in USERS.items() if v["status"] == "banned"]
     if not rows_data:
         return await safe_edit(
-            q, "none banned",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+            q, banner("banned") + "\n\n  none banned",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+            ),
         )
     kb = [
-        [InlineKeyboardButton(f"unban {v.get('name', k)} · {k}", callback_data=f"unban_{k}")]
+        [InlineKeyboardButton(
+            f"✓ unban  ·  {_trunc(v.get('name', k), 18)}  ·  {k}",
+            callback_data=f"unban_{k}",
+        )]
         for k, v in rows_data
     ]
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
-    await safe_edit(q, banner("🚫 Banned"), reply_markup=InlineKeyboardMarkup(kb))
+    kb.append([InlineKeyboardButton("‹ Back", callback_data="admin_root")])
+    await safe_edit(
+        q,
+        banner(f"banned · {len(rows_data)}"),
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
 
 
 @shield
@@ -1492,17 +1644,19 @@ async def unban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     try:
         uid = int(q.data.split("_", 1)[1])
     except (ValueError, IndexError):
         return await safe_edit(q, "bad id")
     if unban(uid):
-        await safe_send(ctx.bot, uid, "✅ access restored — /start again", reply_markup=reply_kb(uid))
+        await safe_send(ctx.bot, uid, "access restored — /start again", reply_markup=reply_kb(uid))
         await safe_edit(
-            q, f"✅ unbanned `{uid}`",
+            q, f"unbanned · `{uid}`",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="a_banned")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="a_banned")]]
+            ),
         )
 
 
@@ -1511,19 +1665,25 @@ async def a_running(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     run = [s for s in SUPERVISORS.values() if s.running()]
     if not run:
         return await safe_edit(
-            q, "none running",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+            q, banner("running") + "\n\n  none running",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+            ),
         )
-    txt = banner("🖥 Running") + "\n\n" + "\n".join(
-        f"• `{s.path.name}` PID `{s.proc.pid}` user `{s.uid}`" for s in run
-    )
+    blocks = [
+        f"●  {s.path.name}\n   pid {s.proc.pid}  ·  user {s.uid}"
+        for s in run
+    ]
+    txt = banner(f"running · {len(run)}") + "\n\n" + "\n\n".join(blocks)
     await safe_edit(
         q, txt, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+        ),
     )
 
 
@@ -1533,7 +1693,7 @@ async def bc_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
         return ConversationHandler.END
-    await safe_edit(q, "📢 send broadcast text\n/cancel to abort")
+    await safe_edit(q, banner("broadcast") + "\n\n  send text\n  /cancel to abort")
     return BC_WAIT
 
 
@@ -1545,10 +1705,14 @@ async def bc_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sent = 0
     for k, u in USERS.items():
         if u["status"] == "approved":
-            r = await safe_send(ctx.bot, int(k), f"📢 {txt}")
+            r = await safe_send(ctx.bot, int(k), f"{BRAND} · broadcast\n\n{txt}")
             if r:
                 sent += 1
-    await safe_reply(update.message, f"✅ sent {sent}", reply_markup=reply_kb(update.effective_user.id))
+    await safe_reply(
+        update.message,
+        f"sent · {sent} {plural(sent, 'user')}",
+        reply_markup=reply_kb(update.effective_user.id),
+    )
     return ConversationHandler.END
 
 
@@ -1563,7 +1727,7 @@ async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
     for sid, sup in list(SUPERVISORS.items()):
         try:
             await sup.stop(ctx.bot)
@@ -1574,9 +1738,10 @@ async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     SCRIPTS.clear()
     persist()
     await safe_edit(
-        q, f"💣 nuked {n} script(s)",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]),
+        q, f"nuked · {n} {plural(n, 'script')}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("‹ Back", callback_data="admin_root")]]
+        ),
     )
 
 
@@ -1585,16 +1750,29 @@ async def a_panel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await _answer(q)
     if q.from_user.id not in ADMIN_IDS:
-        return await safe_edit(q, "❌")
+        return await safe_edit(q, "admin only")
+
+    approved_n = sum(1 for v in USERS.values() if v["status"] == "approved")
+    pending_n = sum(1 for v in USERS.values() if v["status"] == "pending")
+    banned_n = sum(1 for v in USERS.values() if v["status"] == "banned")
+    running_n = sum(1 for s in SUPERVISORS.values() if s.running())
+
+    txt = (
+        banner("admin") + "\n\n"
+        f"  users      {approved_n}\n"
+        f"  pending    {pending_n}\n"
+        f"  banned     {banned_n}\n"
+        f"  running    {running_n}"
+    )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Users", callback_data="a_users"),
-         InlineKeyboardButton("⏳ Pending", callback_data="a_pending")],
-        [InlineKeyboardButton("🖥 Running", callback_data="a_running"),
-         InlineKeyboardButton("🚫 Banned", callback_data="a_banned")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="a_broadcast"),
-         InlineKeyboardButton("💣 Nuke All", callback_data="a_nuke")],
+        [InlineKeyboardButton("Users", callback_data="a_users"),
+         InlineKeyboardButton("Pending", callback_data="a_pending")],
+        [InlineKeyboardButton("Running", callback_data="a_running"),
+         InlineKeyboardButton("Banned", callback_data="a_banned")],
+        [InlineKeyboardButton("Broadcast", callback_data="a_broadcast"),
+         InlineKeyboardButton("✕ Nuke All", callback_data="a_nuke")],
     ])
-    await safe_edit(q, banner("👑 Admin Panel"), reply_markup=kb)
+    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 @shield
@@ -1615,10 +1793,10 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pass
                 SUPERVISORS.pop(sid, None)
                 killed += 1
-        await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
+        await safe_send(ctx.bot, uid, "access revoked")
         await safe_reply(
             update.message,
-            f"🚫 banned `{uid}` · killed `{killed}` script(s)",
+            f"banned · `{uid}` · killed {killed}",
             reply_markup=reply_kb(update.effective_user.id),
         )
 
@@ -1632,9 +1810,9 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await safe_reply(update.message, "usage: `/unban <user_id>`")
     uid = int(parts[1])
     if unban(uid):
-        await safe_send(ctx.bot, uid, "✅ access restored — /start again", reply_markup=reply_kb(uid))
+        await safe_send(ctx.bot, uid, "access restored — /start again", reply_markup=reply_kb(uid))
         await safe_reply(
-            update.message, f"✅ unbanned `{uid}`",
+            update.message, f"unbanned · `{uid}`",
             reply_markup=reply_kb(update.effective_user.id),
         )
 
@@ -1659,9 +1837,10 @@ async def watchdog(bot):
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start", "🌑 Start"),
-        BotCommand("ban", "🚫 Ban User"),
-        BotCommand("unban", "✅ Unban User"),
+        BotCommand("start", "Start"),
+        BotCommand("diag", "Diagnose environment"),
+        BotCommand("ban", "Ban user"),
+        BotCommand("unban", "Unban user"),
     ])
     asyncio.create_task(watchdog(app.bot))
 
@@ -1680,13 +1859,14 @@ async def post_init(app: Application):
         except Exception:
             pass
     if revived:
-        log.info("revived %d script(s) on boot", revived)
+        log.info("revived %d script(s)", revived)
 
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
 
@@ -1696,21 +1876,18 @@ def main():
         fallbacks=[CommandHandler("cancel", up_cancel)],
         per_message=False,
     ))
-
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_entry, pattern="^sedit_")],
         states={EDIT_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_recv)]},
         fallbacks=[CommandHandler("cancel", edit_cancel)],
         per_message=False,
     ))
-
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(env_entry, pattern="^senv_")],
         states={ENV_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, env_recv)]},
         fallbacks=[CommandHandler("cancel", env_cancel)],
         per_message=False,
     ))
-
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(bc_entry, pattern="^a_broadcast$")],
         states={BC_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bc_recv)]},
@@ -1718,7 +1895,7 @@ def main():
         per_message=False,
     ))
 
-    app.add_handler(MessageHandler(filters.Text([BTN_DEPLOY]), on_deploy))
+    app.add_handler(MessageHandler(filters.Text([BTN_SCRIPTS]), on_deploy))
     app.add_handler(MessageHandler(filters.Text([BTN_LOGS]), on_logs))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), on_stats))
     app.add_handler(MessageHandler(filters.Text([BTN_STOP]), on_stop_all))
@@ -1747,7 +1924,7 @@ def main():
     app.add_handler(CallbackQueryHandler(a_panel_cb, pattern="^admin_root$"))
 
     app.add_error_handler(on_error)
-    log.info("Booting OP PY-HOSTER...")
+    log.info("PYHOST v4 online")
     app.run_polling(drop_pending_updates=True)
 
 
