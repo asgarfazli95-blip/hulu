@@ -8,6 +8,7 @@
 - auto-restore on boot · crash notify · self-restart with backoff
 - Auto-installs all required pip packages on boot
 - NO token fallback — BOT_TOKEN must come from env
+- Admin: direct ban/unban of approved users (panel button + /ban + /unban)
 """
 
 # ---- UTF-8 force on Windows ----
@@ -395,7 +396,7 @@ async def ai_fix(err):
         openai.api_key = OPENAI_KEY
         r = await asyncio.to_thread(openai.ChatCompletion.create,
             model="gpt-3.5-turbo",
-            messages=[{"role": "system", "content": "Reply 'FIX: <one-line fix>'"},
+            messages=[{"role": "system", "content": "Reply 'FIX: <one-line fix>'"}, 
                       {"role": "user", "content": err[:1500]}],
             max_tokens=100)
         return r.choices[0].message.content.strip()
@@ -840,6 +841,7 @@ async def script_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _launch(uid, sid, bot):
     s = SCRIPTS.get(sid)
     if not s: return "❌ not found"
+    if not is_ok(uid): return "🚫 access revoked — user is banned"
     p = Path(s["path"]).resolve()
     if not p.exists(): return f"❌ file missing: `{p}`"
     if sid not in SUPERVISORS:
@@ -983,6 +985,9 @@ async def _store_script(uid, path: Path, lang, filename):
 @shield
 async def up_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not is_ok(uid):
+        await safe_reply(update.message, "🚫 access revoked", reply_markup=reply_kb(uid))
+        return ConversationHandler.END
     doc = update.message.document
     if not doc:
         await safe_reply(update.message, "❌ send a file"); return UP_WAIT
@@ -1053,6 +1058,9 @@ async def term_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @shield
 async def term_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not is_ok(uid):
+        await safe_reply(update.message, "🚫 access revoked", reply_markup=reply_kb(uid))
+        return ConversationHandler.END
     txt = (update.message.text or "").strip()
     if not txt: return TERM_SESSION
 
@@ -1418,13 +1426,81 @@ async def on_admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, banner("👑 Admin Panel"), reply_markup=kb)
 
 @shield
+async def a_panel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS:
+        await safe_edit(q, "❌"); return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Users",     callback_data="a_users"),
+         InlineKeyboardButton("⏳ Pending",   callback_data="a_pending")],
+        [InlineKeyboardButton("🖥 Running",   callback_data="a_running"),
+         InlineKeyboardButton("📊 Stats",     callback_data="a_stats")],
+        [InlineKeyboardButton("🚫 Banned",    callback_data="a_banned"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="a_broadcast")],
+        [InlineKeyboardButton("🧹 Cleanup",   callback_data="a_cleanup"),
+         InlineKeyboardButton("💣 Nuke All",  callback_data="a_nuke")],
+    ])
+    await safe_edit(q, banner("👑 Admin Panel"), reply_markup=kb)
+
+@shield
 async def a_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
         await safe_edit(q, "❌"); return
-    rows = [f"• {u['name']} — `{k}`" for k, u in USERS.items() if u["status"] == "approved"]
-    await safe_edit(q, banner("👥 Approved") + "\n\n" + ("\n".join(rows) or "none"),
-                    parse_mode=ParseMode.MARKDOWN)
+    approved = [(k, v) for k, v in USERS.items() if v["status"] == "approved"]
+    if not approved:
+        await safe_edit(q, banner("👥 Approved") + "\n\n(none)",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
+        return
+    rows = []
+    for k, v in approved:
+        rows.append([InlineKeyboardButton(
+            f"👤 {v.get('name', '?')[:28]} · {k}",
+            callback_data=f"adetail_{k}"
+        )])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
+    await safe_edit(q, banner("👥 Approved Users") + f"\n\n`{len(approved)}` user(s) — tap to manage",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(rows))
+
+@shield
+async def a_user_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.from_user.id not in ADMIN_IDS:
+        await safe_edit(q, "❌"); return
+    try:
+        uid = int(q.data.replace("adetail_", "", 1))
+    except ValueError:
+        await safe_edit(q, "bad id"); return
+    u = USERS.get(str(uid))
+    if not u:
+        await safe_edit(q, "gone"); return
+    st = u.get("status", "?")
+    n_scripts = len([s for s in SCRIPTS.values() if s["user_id"] == uid])
+    n_running = sum(1 for s in SUPERVISORS.values() if s.uid == uid and s.running())
+    txt = (
+        banner(f"👤 {u.get('name', '?')}") + "\n\n"
+        f"🆔 `{uid}`\n"
+        f"📛 @{u.get('username', 'no_username')}\n"
+        f"📊 status: *{st}*\n"
+        f"📁 scripts: `{n_scripts}`\n"
+        f"🖥 running: `{n_running}`"
+    )
+    kb = []
+    if st == "approved":
+        kb.append([InlineKeyboardButton("🚫 Ban Now", callback_data=f"ban_{uid}")])
+    elif st == "banned":
+        kb.append([InlineKeyboardButton("✅ Unban", callback_data=f"unban_{uid}")])
+    elif st == "pending":
+        kb.append([
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
+            InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}"),
+        ])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="a_users")])
+    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(kb))
 
 @shield
 async def a_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1435,6 +1511,7 @@ async def a_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not pend:
         await safe_edit(q, "none pending"); return
     rows = [[InlineKeyboardButton(v['name'], callback_data=f"a_p_{k}")] for k, v in pend]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
     await safe_edit(q, banner("⏳ Pending"), reply_markup=InlineKeyboardMarkup(rows))
 
 @shield
@@ -1453,7 +1530,8 @@ async def a_p_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-            InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}")]]))
+            InlineKeyboardButton("🚫 Ban",     callback_data=f"ban_{uid}")],
+            [InlineKeyboardButton("🔙 Back", callback_data="a_pending")]]))
 
 @shield
 async def approve_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1465,7 +1543,9 @@ async def approve_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         await safe_edit(q, "bad"); return
     if approve(uid):
-        await safe_edit(q, f"✅ approved `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(q, f"✅ approved `{uid}`", parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Back to Users", callback_data="a_users")]]))
         await safe_send(ctx.bot, uid, "✅ access granted", reply_markup=reply_kb(uid))
 
 @shield
@@ -1477,10 +1557,31 @@ async def ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = int(q.data.split("_")[1])
     except (ValueError, IndexError):
         await safe_edit(q, "bad"); return
-    if ban(uid):
-        for sid, sup in list(SUPERVISORS.items()):
-            if sup.uid == uid: await sup.stop()
-        await safe_edit(q, f"🚫 banned `{uid}`", parse_mode=ParseMode.MARKDOWN)
+
+    if not ban(uid):
+        await safe_edit(q, f"❌ `{uid}` not in users", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    killed = 0
+    for sid, sup in list(SUPERVISORS.items()):
+        if sup.uid == uid:
+            try:
+                await sup.stop()
+            except Exception:
+                pass
+            SUPERVISORS.pop(sid, None)
+            killed += 1
+
+    await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
+
+    await safe_edit(
+        q,
+        f"🚫 *banned* `{uid}`\n🛑 killed `{killed}` script(s)\n\n"
+        f"ℹ️ They cannot start anything new — `/unban {uid}` to restore.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back to Users", callback_data="a_users")]])
+    )
 
 @shield
 async def a_running(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1489,10 +1590,15 @@ async def a_running(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, "❌"); return
     run = [s for s in SUPERVISORS.values() if s.running()]
     if not run:
-        await safe_edit(q, "none running"); return
+        await safe_edit(q, "none running",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
+        return
     txt = banner("🖥 Running") + "\n\n" + "\n".join(
         f"• `{s.path.name}` PID `{s.proc.pid}` user `{s.uid}` ♻️{s.restarts}" for s in run)
-    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, txt, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
 
 @shield
 async def a_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1502,17 +1608,24 @@ async def a_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_edit(q,
         banner("📊 Stats") + f"\n\n👥 users: {len(USERS)}\n📁 scripts: {len(SCRIPTS)}\n"
         f"🖥 running: {sum(1 for s in SUPERVISORS.values() if s.running())}",
-        parse_mode=ParseMode.MARKDOWN)
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
 
 @shield
 async def a_banned(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.from_user.id not in ADMIN_IDS:
         await safe_edit(q, "❌"); return
-    rows = [(k, v) for k, v in USERS.items() if v["status"] == "banned"]
-    if not rows:
-        await safe_edit(q, "none"); return
-    kb = [[InlineKeyboardButton(f"unban {v['name']}", callback_data=f"unban_{k}")] for k, v in rows]
+    rows_data = [(k, v) for k, v in USERS.items() if v["status"] == "banned"]
+    if not rows_data:
+        await safe_edit(q, "none banned",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
+        return
+    kb = [[InlineKeyboardButton(f"unban {v.get('name', k)} · {k}",
+                                callback_data=f"unban_{k}")] for k, v in rows_data]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_root")])
     await safe_edit(q, banner("🚫 Banned"), reply_markup=InlineKeyboardMarkup(kb))
 
 @shield
@@ -1525,7 +1638,13 @@ async def unban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         await safe_edit(q, "bad"); return
     if unban(uid):
-        await safe_edit(q, f"✅ unbanned `{uid}`", parse_mode=ParseMode.MARKDOWN)
+        await safe_send(ctx.bot, uid, "✅ access restored — /start again",
+                        reply_markup=reply_kb(uid))
+        await safe_edit(q, f"✅ unbanned `{uid}`", parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Back", callback_data="a_banned")]]))
+    else:
+        await safe_edit(q, f"❌ `{uid}` not in users", parse_mode=ParseMode.MARKDOWN)
 
 @shield
 async def a_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1540,7 +1659,9 @@ async def a_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if datetime.fromtimestamp(lg.stat().st_mtime) < cutoff:
                         lg.unlink(); n += 1
                 except Exception: pass
-    await safe_edit(q, f"🧹 removed {n}")
+    await safe_edit(q, f"🧹 removed {n}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
 
 @shield
 async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1550,7 +1671,67 @@ async def a_nuke(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for sid, sup in list(SUPERVISORS.items()):
         await sup.stop(); SUPERVISORS.pop(sid, None)
     n = len(SCRIPTS); SCRIPTS.clear(); persist()
-    await safe_edit(q, f"💣 nuked {n} script(s)", parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(q, f"💣 nuked {n} script(s)", parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data="admin_root")]]))
+
+# ==================== BAN / UNBAN COMMANDS ====================
+@shield
+async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await safe_reply(update.message, "❌ not admin"); return
+    parts = (update.message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await safe_reply(update.message, "usage: `/ban <user_id>`",
+                         parse_mode=ParseMode.MARKDOWN); return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await safe_reply(update.message, "bad id"); return
+    if uid == update.effective_user.id:
+        await safe_reply(update.message, "❌ cannot ban yourself"); return
+    if not ban(uid):
+        await safe_reply(update.message, f"❌ `{uid}` not in users",
+                         parse_mode=ParseMode.MARKDOWN); return
+
+    killed = 0
+    for sid, sup in list(SUPERVISORS.items()):
+        if sup.uid == uid:
+            try:
+                await sup.stop()
+            except Exception:
+                pass
+            SUPERVISORS.pop(sid, None)
+            killed += 1
+
+    await safe_send(ctx.bot, uid, "🚫 your access has been revoked by admin")
+    await safe_reply(update.message,
+        f"🚫 banned `{uid}` · killed `{killed}` script(s)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_kb(update.effective_user.id))
+
+
+@shield
+async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await safe_reply(update.message, "❌ not admin"); return
+    parts = (update.message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await safe_reply(update.message, "usage: `/unban <user_id>`",
+                         parse_mode=ParseMode.MARKDOWN); return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await safe_reply(update.message, "bad id"); return
+    if unban(uid):
+        await safe_send(ctx.bot, uid, "✅ access restored — /start again",
+                        reply_markup=reply_kb(uid))
+        await safe_reply(update.message, f"✅ unbanned `{uid}`",
+                         parse_mode=ParseMode.MARKDOWN,
+                         reply_markup=reply_kb(update.effective_user.id))
+    else:
+        await safe_reply(update.message, f"❌ `{uid}` not in users",
+                         parse_mode=ParseMode.MARKDOWN)
 
 # ==================== FLASK / WATCHDOG / BOOT ====================
 flask_app = Flask(__name__)
@@ -1584,13 +1765,18 @@ async def watchdog(bot):
 
 async def post_init(app: Application):
     try:
-        await app.bot.set_my_commands([BotCommand("start", "🌑 Start"), BotCommand("help", "ℹ️ Help")])
+        await app.bot.set_my_commands([
+            BotCommand("start", "🌑 Start"),
+            BotCommand("help",  "ℹ️ Help"),
+        ])
     except Exception as e:
         log.warning("set_my_commands: %s", e)
     asyncio.create_task(watchdog(app.bot))
     asyncio.create_task(scheduler_loop())
     for sid, s in list(SCRIPTS.items()):
         if not s.get("autorestart", True): continue
+        # skip banned users on boot
+        if not is_ok(s["user_id"]): continue
         p = Path(s["path"]).resolve()
         if not p.exists(): continue
         sup = ScriptSupervisor(sid, s["user_id"], p, s["lang"], True, env=s.get("env", {}))
@@ -1613,6 +1799,8 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
 
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Text([BTN_UPLOAD]), up_entry)],
@@ -1670,17 +1858,19 @@ def main():
     app.add_handler(CallbackQueryHandler(fm_browse,      pattern="^fm_"))
     app.add_handler(CallbackQueryHandler(fm_view,        pattern="^fmview_"))
 
-    app.add_handler(CallbackQueryHandler(a_users,    pattern="^a_users$"))
-    app.add_handler(CallbackQueryHandler(a_pending,  pattern="^a_pending$"))
-    app.add_handler(CallbackQueryHandler(a_p_detail, pattern="^a_p_"))
-    app.add_handler(CallbackQueryHandler(approve_cb, pattern="^approve_"))
-    app.add_handler(CallbackQueryHandler(ban_cb,     pattern="^ban_"))
-    app.add_handler(CallbackQueryHandler(a_running,  pattern="^a_running$"))
-    app.add_handler(CallbackQueryHandler(a_stats,    pattern="^a_stats$"))
-    app.add_handler(CallbackQueryHandler(a_banned,   pattern="^a_banned$"))
-    app.add_handler(CallbackQueryHandler(unban_cb,   pattern="^unban_"))
-    app.add_handler(CallbackQueryHandler(a_cleanup,  pattern="^a_cleanup$"))
-    app.add_handler(CallbackQueryHandler(a_nuke,     pattern="^a_nuke$"))
+    app.add_handler(CallbackQueryHandler(a_users,       pattern="^a_users$"))
+    app.add_handler(CallbackQueryHandler(a_pending,     pattern="^a_pending$"))
+    app.add_handler(CallbackQueryHandler(a_p_detail,    pattern="^a_p_"))
+    app.add_handler(CallbackQueryHandler(approve_cb,    pattern="^approve_"))
+    app.add_handler(CallbackQueryHandler(ban_cb,        pattern="^ban_"))
+    app.add_handler(CallbackQueryHandler(a_running,     pattern="^a_running$"))
+    app.add_handler(CallbackQueryHandler(a_stats,       pattern="^a_stats$"))
+    app.add_handler(CallbackQueryHandler(a_banned,      pattern="^a_banned$"))
+    app.add_handler(CallbackQueryHandler(unban_cb,      pattern="^unban_"))
+    app.add_handler(CallbackQueryHandler(a_cleanup,     pattern="^a_cleanup$"))
+    app.add_handler(CallbackQueryHandler(a_nuke,        pattern="^a_nuke$"))
+    app.add_handler(CallbackQueryHandler(a_user_detail, pattern="^adetail_"))
+    app.add_handler(CallbackQueryHandler(a_panel_cb,    pattern="^admin_root$"))
 
     app.add_error_handler(on_error)
     log.info("[SHADOW] booting…")
