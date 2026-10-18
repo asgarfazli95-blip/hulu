@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (High-Level OP Edition - FINAL)
+𝐏𝐘-𝐇𝐎𝐒𝐓𝐄𝐑 (High-Level OP Edition - FINAL FIX)
 - Strictly runs .py files.
 - Secret Spy: Notifies admin on every Upload/Start/Stop.
-- Bulletproof Auto-Heal: Parses custom pip messages, installs all missing deps with versions.
+- Bulletproof Auto-Heal: Parses custom pip messages, installs all missing deps.
 - Full Admin Panel: Approve, Ban, Unban, Nuke, Broadcast.
 """
 
@@ -264,63 +264,54 @@ class ScriptSupervisor:
         try:
             note = ""
             pip_logs = []
+            pkgs_to_install = set()
+
+            # 1. Extract from `pip install ...` line
+            pip_matches = re.findall(r"pip install (.+)", tail)
+            for match in pip_matches:
+                cmd_str = match.strip().replace('"', '').replace("'", "")
+                for part in cmd_str.split():
+                    if part and not part.startswith("-") and part not in ("pip", "install", "-U", "-r"):
+                        pkgs_to_install.add(part)
             
-            # 1. Try to run the exact `pip install ...` line the script printed
-            pip_matches = re.findall(r"pip install (.+)", tail, re.MULTILINE)
-            if pip_matches:
-                cmd_str = pip_matches[0].strip()
-                try:
-                    args = shlex.split(cmd_str)
-                    rc, out = await run_cmd([sys.executable, "-m", "pip", "install"] + args)
-                    if rc == 0:
-                        note = f"📦 `pip install {cmd_str}` executed"
-                    else:
-                        pip_logs.append(f"Full command failed: {out[-200:]}")
-                except Exception as e:
-                    pip_logs.append(f"Parse error: {e}")
+            # 2. Extract from `No module named '...'`
+            mod_matches = re.findall(r"No module named ['\"]([^'\"]+)['\"]", tail)
+            for mod in mod_matches:
+                mod = mod.split(".")[0]
+                pkg_map = {
+                    "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
+                    "gtts": "gTTS", "edge_tts": "edge-tts", "yt_dlp": "yt-dlp",
+                    "PIL": "Pillow", "bs4": "beautifulsoup4", "cv2": "opencv-python",
+                    "requests": "requests"
+                }
+                pkgs_to_install.add(pkg_map.get(mod, mod))
+
+            # 3. Fallback if completely empty (guarantee heal triggers)
+            if not pkgs_to_install and "missing dep" in tail:
+                pkgs_to_install.update(["requests", "python-telegram-bot>=21", "telethon", "yt-dlp", "gTTS", "edge-tts"])
+
+            success_pkgs = []
+            failed_pkgs = []
             
-            # 2. If full command failed, try extracting individual missing modules
-            if not note:
-                pkgs_to_install = set()
-                mod_matches = re.findall(r"No module named ['\"]([^'\"]+)['\"]", tail)
-                for mod in mod_matches:
-                    mod = mod.split(".")[0]
-                    pkg_map = {
-                        "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
-                        "gtts": "gTTS", "edge_tts": "edge-tts", "yt_dlp": "yt-dlp",
-                        "PIL": "Pillow", "bs4": "beautifulsoup4", "cv2": "opencv-python"
-                    }
-                    pkgs_to_install.add(pkg_map.get(mod, mod))
+            for pkg in pkgs_to_install:
+                if not pkg or pkg.startswith("-"): continue
                 
-                # Also extract from the pip install line just in case
-                if pip_matches:
-                    for match in pip_matches:
-                        for part in match.split():
-                            part = part.strip("'\"")
-                            if part and not part.startswith("-") and part not in ("pip", "install", "-U", "-r"):
-                                pkgs_to_install.add(part)
-
-                success_pkgs = []
-                failed_pkgs = []
-                for pkg in pkgs_to_install:
-                    if not pkg or pkg.startswith("-"): continue
+                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", pkg])
+                if rc == 0:
+                    success_pkgs.append(pkg)
+                    continue
                     
-                    rc, out = await run_cmd([sys.executable, "-m", "pip", "install", pkg])
-                    if rc == 0:
-                        success_pkgs.append(pkg)
-                        continue
-                        
-                    rc, out = await run_cmd([sys.executable, "-m", "pip", "install", "--user", pkg])
-                    if rc == 0:
-                        success_pkgs.append(pkg)
-                    else:
-                        failed_pkgs.append(pkg)
-                        pip_logs.append(f"[{pkg}]\n{out[-200:]}")
+                rc, out = await run_cmd([sys.executable, "-m", "pip", "install", "--user", pkg])
+                if rc == 0:
+                    success_pkgs.append(pkg)
+                else:
+                    failed_pkgs.append(pkg)
+                    pip_logs.append(f"[{pkg}] {out[-100:]}")
 
-                if success_pkgs:
-                    note += f"📦 Installed: `{'`, `'.join(success_pkgs)}`\n"
-                if failed_pkgs:
-                    note += f"❌ Failed: `{'`, `'.join(failed_pkgs)}`\n"
+            if success_pkgs:
+                note += f"📦 Installed: `{'`, `'.join(success_pkgs)}`\n"
+            if failed_pkgs:
+                note += f"❌ Failed: `{'`, `'.join(failed_pkgs)}`\n"
 
             if note:
                 await safe_send(bot, self.uid, f"🩹 *auto-heal* · `{self.path.name}`\n{note}\n♻️ restarting…", parse_mode=ParseMode.MARKDOWN)
